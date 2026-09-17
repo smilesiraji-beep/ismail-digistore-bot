@@ -26,7 +26,7 @@ kb = ReplyKeyboardMarkup(keyboard=[
 dp = Dispatcher()
 
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
+    [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices"), InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")],
     [InlineKeyboardButton(text="📦 Pending Payments", callback_data="admin:pending")],
     [InlineKeyboardButton(text="🎁 Referral Campaigns", callback_data="admin:ref_help")],
     [InlineKeyboardButton(text="💳 Payment Settings", callback_data="admin:payment_help")],
@@ -355,7 +355,7 @@ async def admin_prices(c: CallbackQuery):
         supplier = money(p.get("price_usd") or p.get("price"))
         selling = await custom_price(pid)
         supplier_text = f"${supplier:.2f}" if isinstance(supplier, Decimal) else "Unavailable"
-        selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set (supplier price is shown)"
+        selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set (customer sees Unavailable)"
         await c.message.answer(
             f"📦 <b>{name}</b>\n🆔 <code>{pid}</code>\n🏷 Supplier: {supplier_text}\n💵 Your selling price: {selling_text}",
             parse_mode="HTML"
@@ -524,6 +524,53 @@ async def admin_payment_help(c: CallbackQuery):
     current=await get_setting("payment_instructions", "Not configured")
     await c.message.answer(f"💳 Current payment instructions:\n{current}\n\nChange with:\n/setpayment YOUR_PAYMENT_INSTRUCTIONS")
     await c.answer()
+
+@dp.callback_query(F.data == "admin:bulk_prices")
+async def admin_bulk_prices(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    await c.message.answer(
+        "🧾 Bulk Price Update\n\nSend one message in this format:\n\n"
+        "/bulkprice\n105=1.50\n130=12.00\n93=2.00\n\n"
+        "Use PRODUCT_ID=USD_PRICE on each line."
+    )
+    await c.answer()
+
+@dp.message(Command("bulkprice"))
+async def bulkprice(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    lines = (m.text or "").splitlines()[1:]
+    updates = []
+    errors = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            errors.append(line)
+            continue
+        pid, price_text = [x.strip() for x in line.split("=", 1)]
+        try:
+            val = Decimal(price_text)
+            if not pid or val < 0:
+                raise InvalidOperation
+            updates.append((pid, f"{val:.2f}"))
+        except (InvalidOperation, ValueError):
+            errors.append(line)
+    if not updates:
+        return await m.answer("⚠️ No valid prices found. Use:\n/bulkprice\n105=1.50\n130=12.00")
+    async with aiosqlite.connect(DB) as db:
+        await db.executemany(
+            "INSERT INTO prices(product_id,selling_price_usd) VALUES(?,?) "
+            "ON CONFLICT(product_id) DO UPDATE SET selling_price_usd=excluded.selling_price_usd",
+            updates,
+        )
+        await db.commit()
+    text = f"✅ {len(updates)} product price(s) updated successfully."
+    if errors:
+        text += "\n⚠️ Skipped invalid line(s): " + ", ".join(errors[:10])
+    await m.answer(text)
 
 @dp.message(Command("setprice"))
 async def setprice(m: Message):
