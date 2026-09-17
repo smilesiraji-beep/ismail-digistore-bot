@@ -348,18 +348,14 @@ async def admin_prices(c: CallbackQuery):
     if not items:
         await c.message.answer("🛍️ No products are currently available.")
         return await c.answer()
-    await c.message.answer("💵 Product Prices\n\nCopy a Product ID below, then use:\n/setprice PRODUCT_ID USD_PRICE")
+    lines = ["💵 <b>Product Prices</b>", "", "Use <code>/setprice PRODUCT_ID USD_PRICE</code> or 🧾 Bulk Price Update.", ""]
     for p in items[:30]:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         name = p.get("name") or p.get("title") or "Product"
-        supplier = money(p.get("price_usd") or p.get("price"))
         selling = await custom_price(pid)
-        supplier_text = f"${supplier:.2f}" if isinstance(supplier, Decimal) else "Unavailable"
-        selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set (customer sees Unavailable)"
-        await c.message.answer(
-            f"📦 <b>{name}</b>\n🆔 <code>{pid}</code>\n🏷 Supplier: {supplier_text}\n💵 Your selling price: {selling_text}",
-            parse_mode="HTML"
-        )
+        selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
+        lines.append(f"<b>{name}</b> | ID: <code>{pid}</code> | {selling_text}")
+    await c.message.answer("\n".join(lines), parse_mode="HTML")
     await c.answer()
 
 
