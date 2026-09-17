@@ -86,7 +86,16 @@ STOREBAT_PRODUCT_ORDER = [
     "Manus Pro 1 Year",
     "Snapchat Plus+ 3M FW available",
     "Snapchat Plus+ 6M FW available",
+    "Claude 100$ Api 30 D warranty",
+    "Claude 500$ Api 30 Days",
 ]
+
+# Admin-approved selling prices for newly added products.
+# A price saved later through Product Prices still overrides these defaults.
+DEFAULT_SELLING_PRICES = {
+    "Claude 100$ Api 30 D warranty": Decimal("3.00"),
+    "Claude 500$ Api 30 Days": Decimal("7.50"),
+}
 
 def _catalog_key(text: str) -> str:
     return "".join(ch.lower() for ch in str(text) if ch.isalnum())
@@ -100,7 +109,7 @@ def canonical_storebat_name(text: str):
     return None
 
 def sort_storebat_products(items):
-    # Strict allow-list: only the 58 products approved by the admin are shown.
+    # Strict allow-list: only the 60 products approved by the admin are shown.
     order = {_catalog_key(name): i for i, name in enumerate(STOREBAT_PRODUCT_ORDER)}
     kept = []
     for p in items:
@@ -200,11 +209,20 @@ async def custom_price(product_id: str):
         row = await cur.fetchone()
     return money(row[0]) if row else None
 
-async def display_price(product: dict):
-    # Customer-facing price: ONLY the admin-defined selling price.
-    # Supplier cost must never leak to customers.
+async def selling_price_for_product(product: dict):
+    # Saved admin price wins. For newly approved catalog items, use the
+    # explicitly approved default selling price until the admin changes it.
     pid = product.get("id") or product.get("product_id") or product.get("uuid")
-    return await custom_price(str(pid)) if pid is not None else None
+    saved = await custom_price(str(pid)) if pid is not None else None
+    if saved is not None:
+        return saved
+    canonical = canonical_storebat_name(str(product.get("name") or product.get("title") or ""))
+    return DEFAULT_SELLING_PRICES.get(canonical)
+
+async def display_price(product: dict):
+    # Customer-facing price: ONLY the admin-defined/approved selling price.
+    # Supplier cost must never leak to customers.
+    return await selling_price_for_product(product)
 
 async def get_product(product_id: str):
     data = await vente.products(lang="en")
@@ -447,7 +465,7 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
         if not pid:
             continue
         name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
-        selling = await custom_price(pid)
+        selling = await selling_price_for_product(p)
         selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
         stock = p.get("stock")
         stock_text = f"📦 {stock}" if stock is not None else "📦 —"
@@ -506,7 +524,7 @@ async def admin_price_item(c: CallbackQuery):
     if not p:
         return await c.answer("Product not found", show_alert=True)
     name = str(p.get("name") or p.get("title") or "Product")
-    selling = await custom_price(pid)
+    selling = await selling_price_for_product(p)
     selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
     async with aiosqlite.connect(DB) as db:
         await db.execute(
