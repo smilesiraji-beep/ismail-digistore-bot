@@ -25,6 +25,87 @@ kb = ReplyKeyboardMarkup(keyboard=[
 
 dp = Dispatcher()
 
+# Storebat catalog display order supplied by the admin.
+# Products still come live from VenteBot API; this only controls their serial/order.
+STOREBAT_PRODUCT_ORDER = [
+    "Gemini 18 months",
+    "ChatGPT - GPT Plus K12 edu 24M (NW)",
+    "Google AI Pro 12m FW",
+    "Grok - Super Grok 9-10 Days (W5D)",
+    "Capcut pro 1M FW",
+    "Capcut pro 1M 1600 iA credit FW",
+    "Capcut 6month FW individual",
+    "Descript Creator 1 Year",
+    "Cousera - Bussiness 6m (ready account)",
+    "Gamma AI - Plus 1M (W25D)",
+    "Codex API",
+    "Claude API",
+    "Notion 1M-12M",
+    "VPNs nord,proton,HMA,surfshark...",
+    "Microsoft Office 365 Plus 1 year",
+    "MIRO",
+    "zoom Pro",
+    "Figma Pro Edu 2yrs",
+    "iLovePdf Premium 1Yr",
+    "Adobe Express Premium (12 Months)",
+    "Amazon prime 6 months video 6 profile",
+    "Peacock official subscriptions 1year",
+    "Wink - Wink Smile+ 7D (W5D)",
+    "JetBrains EDU 1 year",
+    "Autodesk Admin Dashboard Access(3000 invite",
+    "Quizlet",
+    "wordwall PRO",
+    "Brain.fm 1 Year",
+    "Quillbot - 1 month",
+    "customer.io essentials 1year",
+    "Fin ia agent +fin advanced",
+    "Factory 12m",
+    "Framer Pro 12m",
+    "Granola Business 12M",
+    "Gumloop Pro 12m",
+    "Jam Team 10 Seat 12m",
+    "Linear business 1 year",
+    "Mobbin 10x Seat 12m",
+    "Posthog scale 2x monthly limits",
+    "Railway hobby 1 year",
+    "readwise 1 Year",
+    "Resend Pro 12m",
+    "Supercut Pro 10 Seat 12m",
+    "Wispr Flow Pro 12m",
+    "Magic Patterns Starter 12m",
+    "Warp build 1 year",
+    "Gamma Pro 12m",
+    "Elevenlabs - Free 10k Credits (W24H)",
+    "ElevenLabs Creator 12m",
+    "Replit Core 12m",
+    "Runway Pro 12m",
+    "Supabase Pro",
+    "Lovable Pro 12m",
+    "N8N Starter 12m",
+    "Cursor Pro 12m",
+    "Manus Pro 1 Year",
+    "Snapchat Plus+ 3M FW available",
+    "Snapchat Plus+ 6M FW available",
+]
+
+def _catalog_key(text: str) -> str:
+    return "".join(ch.lower() for ch in str(text) if ch.isalnum())
+
+def sort_storebat_products(items):
+    order = {_catalog_key(name): i for i, name in enumerate(STOREBAT_PRODUCT_ORDER)}
+    def rank(p):
+        name = str(p.get("name") or p.get("title") or "")
+        key = _catalog_key(name)
+        if key in order:
+            return (order[key], name.lower())
+        # Prefix matching handles supplier labels that contain extra text after the visible name.
+        for wanted, idx in order.items():
+            if wanted and (key.startswith(wanted) or wanted.startswith(key)):
+                return (idx, name.lower())
+        return (len(order) + 1, name.lower())
+    return sorted(items, key=rank)
+
+
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices"), InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")],
     [InlineKeyboardButton(text="📦 Pending Payments", callback_data="admin:pending")],
@@ -141,9 +222,9 @@ async def start(m: Message):
     await m.answer("Welcome to Ismail Digistore! 🛍️\nChoose an option below.", reply_markup=kb)
 
 async def product_list_markup():
-    items = extract_products(await vente.products(lang="en"))
+    items = sort_storebat_products(extract_products(await vente.products(lang="en")))
     rows = []
-    for p in items[:30]:
+    for p in items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
@@ -341,7 +422,7 @@ async def admin_prices(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
     try:
-        items = extract_products(await vente.products(lang="en"))
+        items = sort_storebat_products(extract_products(await vente.products(lang="en")))
     except VenteBotError as e:
         await c.message.answer(f"⚠️ Could not load products: {e}")
         return await c.answer()
@@ -349,7 +430,7 @@ async def admin_prices(c: CallbackQuery):
         await c.message.answer("🛍️ No products are currently available.")
         return await c.answer()
     rows = []
-    for p in items[:30]:
+    for p in items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
