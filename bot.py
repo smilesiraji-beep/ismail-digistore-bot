@@ -358,9 +358,9 @@ async def admin_prices(c: CallbackQuery):
         selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
         stock = p.get("stock")
         stock_text = f"📦 {stock}" if stock is not None else "📦 —"
-        label = f"{p.get('emoji') or '📦'} {name} | {selling_text} | {stock_text}"
+        label = f"ID {pid} | {p.get('emoji') or '📦'} {name} | {selling_text} | {stock_text}"
         if len(label) > 60:
-            label = f"{p.get('emoji') or '📦'} {name[:31].rstrip()}… | {selling_text} | {stock_text}"
+            label = f"ID {pid} | {p.get('emoji') or '📦'} {name[:23].rstrip()}… | {selling_text} | {stock_text}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"admin:price_item:{pid}")])
     rows.append([InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")])
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
