@@ -386,11 +386,19 @@ async def admin_price_item(c: CallbackQuery):
     name = str(p.get("name") or p.get("title") or "Product")
     selling = await custom_price(pid)
     selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO user_input_state(telegram_id,action,product_id,product_name) VALUES(?,?,?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=NULL,product_id=excluded.product_id,"
+            "unit_price_usd=NULL,product_name=excluded.product_name,created_at=CURRENT_TIMESTAMP",
+            (c.from_user.id, "admin_set_price", pid, name),
+        )
+        await db.commit()
     await c.message.answer(
         f"💵 <b>{name}</b>\n"
-        f"ID: <code>{pid}</code>\n"
-        f"Selling price: <b>{selling_text}</b>\n\n"
-        f"Set/change price with:\n<code>/setprice {pid} PRICE</code>",
+        f"Current selling price: <b>{selling_text}</b>\n\n"
+        "Send the new selling price in USD only.\n"
+        "Example: <code>8.00</code>",
         parse_mode="HTML",
     )
     await c.answer()
@@ -795,6 +803,25 @@ async def pending_text_input(m: Message):
     if not state: return
     action, oid, pid = state
     text=(m.text or "").strip()
+    if action == "admin_set_price":
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        try:
+            val = Decimal(text)
+            if val < 0:
+                raise InvalidOperation
+        except (InvalidOperation, ValueError):
+            return await m.answer("⚠️ Send a valid USD price, for example: 8.00")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute(
+                "INSERT INTO prices(product_id,selling_price_usd) VALUES(?,?) "
+                "ON CONFLICT(product_id) DO UPDATE SET selling_price_usd=excluded.selling_price_usd",
+                (pid, f"{val:.2f}"),
+            )
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?", (m.from_user.id,))
+            await db.commit()
+        await m.answer(f"✅ Selling price updated to ${val:.2f}.")
+        return
     if action == "custom_qty":
         if not text.isdigit() or not (1 <= int(text) <= 100):
             return await m.answer("⚠️ Send a quantity from 1 to 100, for example: 8")
