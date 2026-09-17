@@ -136,20 +136,96 @@ async def start(m: Message):
 
 @dp.message(F.text == "🛍️ Products")
 async def products(m: Message):
-    try: items = extract_products(await vente.products(lang="en"))
+    try:
+        items = extract_products(await vente.products(lang="en"))
     except VenteBotError as e:
-        await m.answer(f"⚠️ Product catalog is not available yet.\n{e}"); return
-    if not items: await m.answer("🛍️ No products are currently available."); return
-    await m.answer("🛍️ Ismail Digistore — choose a product:")
+        await m.answer(f"⚠️ Product catalog is not available yet.\n{e}")
+        return
+    if not items:
+        await m.answer("🛍️ No products are currently available.")
+        return
+
+    rows = []
     for p in items[:30]:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         name = p.get("name") or p.get("title") or "Product"
         stock = p.get("stock")
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Price unavailable"
-        stock_text = f"\n📦 Stock: {stock}" if stock is not None else ""
-        buttons = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Buy", callback_data=f"buy:{pid}")]])
-        await m.answer(f"{p.get('emoji') or '📦'} <b>{name}</b>\n💵 {price_text}{stock_text}", parse_mode="HTML", reply_markup=buttons)
+        stock_text = f" | 📦 {stock}" if stock is not None else ""
+        label = f"{p.get('emoji') or '📦'} {name} | {price_text}{stock_text}"
+        # Telegram inline button text has practical display limits; keep long names compact.
+        if len(label) > 60:
+            short_name = name[:34].rstrip() + "…"
+            label = f"{p.get('emoji') or '📦'} {short_name} | {price_text}{stock_text}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"product:{pid}")])
+
+    rows.append([
+        InlineKeyboardButton(text="🔄 Refresh Products", callback_data="products:refresh"),
+        InlineKeyboardButton(text="⬅️ Back", callback_data="products:back")
+    ])
+    await m.answer("🛍️ <b>Ismail Digistore — Products</b>\nChoose a product:", parse_mode="HTML",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data == "products:refresh")
+async def refresh_products_button(c: CallbackQuery):
+    try:
+        items = extract_products(await vente.products(lang="en"))
+    except VenteBotError as e:
+        await c.answer(f"Could not refresh: {e}", show_alert=True)
+        return
+    rows = []
+    for p in items[:30]:
+        pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
+        name = p.get("name") or p.get("title") or "Product"
+        stock = p.get("stock")
+        price = await display_price(p)
+        price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Price unavailable"
+        stock_text = f" | 📦 {stock}" if stock is not None else ""
+        label = f"{p.get('emoji') or '📦'} {name} | {price_text}{stock_text}"
+        if len(label) > 60:
+            label = f"{p.get('emoji') or '📦'} {name[:34].rstrip()}… | {price_text}{stock_text}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"product:{pid}")])
+    rows.append([InlineKeyboardButton(text="🔄 Refresh Products", callback_data="products:refresh"),
+                 InlineKeyboardButton(text="⬅️ Back", callback_data="products:back")])
+    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer("Products refreshed")
+
+
+@dp.callback_query(F.data == "products:back")
+async def products_back(c: CallbackQuery):
+    await c.message.edit_text("🛍️ Product list closed. Use the Products button below anytime.")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("product:"))
+async def product_details(c: CallbackQuery):
+    pid = c.data.split(":", 1)[1]
+    try:
+        p = await get_product(pid)
+    except VenteBotError as e:
+        await c.message.answer(f"⚠️ {e}")
+        return await c.answer()
+    if not p:
+        await c.answer("Product is no longer available.", show_alert=True)
+        return
+    name = p.get("name") or p.get("title") or "Product"
+    price = await display_price(p)
+    price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Price unavailable"
+    stock = p.get("stock")
+    description = p.get("description") or ""
+    text = f"{p.get('emoji') or '📦'} <b>{name}</b>\n💵 Price: {price_text}"
+    if stock is not None:
+        text += f"\n📦 Stock: {stock}"
+    if description:
+        text += f"\n\n{description}"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🛒 Buy", callback_data=f"buy:{pid}")
+    ]])
+    await c.message.answer(text, parse_mode="HTML", reply_markup=markup)
+    await c.answer()
+
 
 @dp.callback_query(F.data.startswith("buy:"))
 async def buy_product(c: CallbackQuery):
