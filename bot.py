@@ -417,8 +417,7 @@ async def admin_panel(m: Message):
     if m.from_user.id not in ADMIN_IDS: return
     await m.answer("⚙️ Ismail Digistore Admin", reply_markup=ADMIN_KB)
 
-@dp.callback_query(F.data == "admin:prices")
-async def admin_prices(c: CallbackQuery):
+async def show_admin_prices(c: CallbackQuery, page: int = 0):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
     try:
@@ -429,8 +428,14 @@ async def admin_prices(c: CallbackQuery):
     if not items:
         await c.message.answer("🛍️ No products are currently available.")
         return await c.answer()
+
+    page_size = 10
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    page_items = items[page * page_size:(page + 1) * page_size]
+
     rows = []
-    for p in items:
+    for p in page_items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
@@ -439,18 +444,47 @@ async def admin_prices(c: CallbackQuery):
         selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
         stock = p.get("stock")
         stock_text = f"📦 {stock}" if stock is not None else "📦 —"
-        label = f"ID {pid} | {p.get('emoji') or '📦'} {name} | {selling_text} | {stock_text}"
+        emoji = p.get("emoji") or "📦"
+        label = f"{emoji} {name} | {selling_text} | {stock_text}"
         if len(label) > 60:
-            label = f"ID {pid} | {p.get('emoji') or '📦'} {name[:23].rstrip()}… | {selling_text} | {stock_text}"
+            label = f"{emoji} {name[:30].rstrip()}… | {selling_text} | {stock_text}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"admin:price_item:{pid}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:prices_page:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="admin:prices_noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:prices_page:{page+1}"))
+    rows.append(nav)
     rows.append([InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")])
-    markup = InlineKeyboardMarkup(inline_keyboard=rows)
-    await c.message.answer(
+
+    text = (
         "💵 <b>Product Prices</b>\n\n"
-        "Tap a product to see its ID and price-setting command.",
-        parse_mode="HTML",
-        reply_markup=markup,
+        "Tap a product, then send only the new USD selling price.\n"
+        f"Products: <b>{len(items)}</b> • Page <b>{page+1}/{total_pages}</b>"
     )
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    if c.data.startswith("admin:prices_page:"):
+        await c.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await c.message.answer(text, parse_mode="HTML", reply_markup=markup)
+    await c.answer()
+
+@dp.callback_query(F.data == "admin:prices")
+async def admin_prices(c: CallbackQuery):
+    await show_admin_prices(c, 0)
+
+@dp.callback_query(F.data.startswith("admin:prices_page:"))
+async def admin_prices_page(c: CallbackQuery):
+    try:
+        page = int(c.data.rsplit(":", 1)[-1])
+    except ValueError:
+        page = 0
+    await show_admin_prices(c, page)
+
+@dp.callback_query(F.data == "admin:prices_noop")
+async def admin_prices_noop(c: CallbackQuery):
     await c.answer()
 
 @dp.callback_query(F.data.startswith("admin:price_item:"))
