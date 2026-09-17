@@ -71,6 +71,12 @@ async def init_db():
           product_name TEXT, offer_price_usd TEXT NOT NULL, enabled INTEGER DEFAULT 1,
           starts_at TEXT, ends_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS user_input_state(
+          telegram_id INTEGER PRIMARY KEY, action TEXT NOT NULL, order_id INTEGER,
+          product_id TEXT, unit_price_usd TEXT, product_name TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_reference
+          ON orders(payment_reference) WHERE payment_reference IS NOT NULL;
         ''')
         # Safe upgrades from older DB versions.
         cols = {r[1] for r in await (await db.execute("PRAGMA table_info(orders)")).fetchall()}
@@ -107,10 +113,10 @@ async def custom_price(product_id: str):
     return money(row[0]) if row else None
 
 async def display_price(product: dict):
+    # Customer-facing price: ONLY the admin-defined selling price.
+    # Supplier cost must never leak to customers.
     pid = product.get("id") or product.get("product_id") or product.get("uuid")
-    override = await custom_price(str(pid)) if pid is not None else None
-    supplier = money(product.get("price_usd") or product.get("price"))
-    return override if override is not None else supplier
+    return await custom_price(str(pid)) if pid is not None else None
 
 async def get_product(product_id: str):
     data = await vente.products(lang="en")
@@ -136,96 +142,20 @@ async def start(m: Message):
 
 @dp.message(F.text == "🛍️ Products")
 async def products(m: Message):
-    try:
-        items = extract_products(await vente.products(lang="en"))
+    try: items = extract_products(await vente.products(lang="en"))
     except VenteBotError as e:
-        await m.answer(f"⚠️ Product catalog is not available yet.\n{e}")
-        return
-    if not items:
-        await m.answer("🛍️ No products are currently available.")
-        return
-
-    rows = []
+        await m.answer(f"⚠️ Product catalog is not available yet.\n{e}"); return
+    if not items: await m.answer("🛍️ No products are currently available."); return
+    await m.answer("🛍️ Ismail Digistore — choose a product:")
     for p in items[:30]:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         name = p.get("name") or p.get("title") or "Product"
         stock = p.get("stock")
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Price unavailable"
-        stock_text = f" | 📦 {stock}" if stock is not None else ""
-        label = f"{p.get('emoji') or '📦'} {name} | {price_text}{stock_text}"
-        # Telegram inline button text has practical display limits; keep long names compact.
-        if len(label) > 60:
-            short_name = name[:34].rstrip() + "…"
-            label = f"{p.get('emoji') or '📦'} {short_name} | {price_text}{stock_text}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"product:{pid}")])
-
-    rows.append([
-        InlineKeyboardButton(text="🔄 Refresh Products", callback_data="products:refresh"),
-        InlineKeyboardButton(text="⬅️ Back", callback_data="products:back")
-    ])
-    await m.answer("🛍️ <b>Ismail Digistore — Products</b>\nChoose a product:", parse_mode="HTML",
-                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@dp.callback_query(F.data == "products:refresh")
-async def refresh_products_button(c: CallbackQuery):
-    try:
-        items = extract_products(await vente.products(lang="en"))
-    except VenteBotError as e:
-        await c.answer(f"Could not refresh: {e}", show_alert=True)
-        return
-    rows = []
-    for p in items[:30]:
-        pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
-        name = p.get("name") or p.get("title") or "Product"
-        stock = p.get("stock")
-        price = await display_price(p)
-        price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Price unavailable"
-        stock_text = f" | 📦 {stock}" if stock is not None else ""
-        label = f"{p.get('emoji') or '📦'} {name} | {price_text}{stock_text}"
-        if len(label) > 60:
-            label = f"{p.get('emoji') or '📦'} {name[:34].rstrip()}… | {price_text}{stock_text}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"product:{pid}")])
-    rows.append([InlineKeyboardButton(text="🔄 Refresh Products", callback_data="products:refresh"),
-                 InlineKeyboardButton(text="⬅️ Back", callback_data="products:back")])
-    await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await c.answer("Products refreshed")
-
-
-@dp.callback_query(F.data == "products:back")
-async def products_back(c: CallbackQuery):
-    await c.message.edit_text("🛍️ Product list closed. Use the Products button below anytime.")
-    await c.answer()
-
-
-@dp.callback_query(F.data.startswith("product:"))
-async def product_details(c: CallbackQuery):
-    pid = c.data.split(":", 1)[1]
-    try:
-        p = await get_product(pid)
-    except VenteBotError as e:
-        await c.message.answer(f"⚠️ {e}")
-        return await c.answer()
-    if not p:
-        await c.answer("Product is no longer available.", show_alert=True)
-        return
-    name = p.get("name") or p.get("title") or "Product"
-    price = await display_price(p)
-    price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Price unavailable"
-    stock = p.get("stock")
-    description = p.get("description") or ""
-    text = f"{p.get('emoji') or '📦'} <b>{name}</b>\n💵 Price: {price_text}"
-    if stock is not None:
-        text += f"\n📦 Stock: {stock}"
-    if description:
-        text += f"\n\n{description}"
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🛒 Buy", callback_data=f"buy:{pid}")
-    ]])
-    await c.message.answer(text, parse_mode="HTML", reply_markup=markup)
-    await c.answer()
-
+        stock_text = f"\n📦 Stock: {stock}" if stock is not None else ""
+        buttons = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Buy", callback_data=f"buy:{pid}")]])
+        await m.answer(f"{p.get('emoji') or '📦'} <b>{name}</b>\n💵 {price_text}{stock_text}", parse_mode="HTML", reply_markup=buttons)
 
 @dp.callback_query(F.data.startswith("buy:"))
 async def buy_product(c: CallbackQuery):
@@ -234,14 +164,88 @@ async def buy_product(c: CallbackQuery):
     except VenteBotError as e: await c.message.answer(f"⚠️ {e}"); return await c.answer()
     if not p: await c.message.answer("Product is no longer available."); return await c.answer()
     price = await display_price(p)
-    if price is None: await c.message.answer("Price is not configured for this product."); return await c.answer()
+    if price is None:
+        await c.message.answer("⚠️ This product is not on sale yet. Please contact support.")
+        return await c.answer()
     name = p.get("name") or p.get("title") or "Product"
+    qkb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1", callback_data=f"qty:{pid}:1"),
+         InlineKeyboardButton(text="2", callback_data=f"qty:{pid}:2"),
+         InlineKeyboardButton(text="3", callback_data=f"qty:{pid}:3")],
+        [InlineKeyboardButton(text="Custom", callback_data=f"qtycustom:{pid}")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="order:cancel")],
+    ])
+    await c.message.answer(f"📦 <b>{name}</b>\n💵 Unit price: ${price:.2f}\n\nChoose quantity:", parse_mode="HTML", reply_markup=qkb)
+    await c.answer()
+
+async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
+    try: p = await get_product(pid)
+    except VenteBotError as e: return await c.message.answer(f"⚠️ {e}")
+    if not p: return await c.message.answer("Product is no longer available.")
+    price = await display_price(p)
+    if price is None: return await c.message.answer("⚠️ This product is not on sale yet.")
+    stock = p.get("stock")
+    try:
+        if stock is not None and int(stock) < qty: return await c.message.answer(f"⚠️ Only {stock} item(s) are in stock.")
+    except (TypeError, ValueError): pass
+    name = p.get("name") or p.get("title") or "Product"
+    total = price * qty
     idem = str(uuid.uuid4())
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute("INSERT INTO orders(telegram_id,product_id,product_name,quantity,amount_usd,idempotency_key) VALUES(?,?,?,?,?,?)",
-                               (c.from_user.id, pid, name, 1, f"{price:.2f}", idem))
+                               (c.from_user.id, pid, name, qty, f"{total:.2f}", idem))
         oid = cur.lastrowid; await db.commit()
-    await c.message.answer(f"🧾 Order #{oid}\n📦 {name}\n💵 Total: ${price:.2f}\n\nIf this product requires an email, username, profile link or other activation identifier, send:\n/activate {oid} YOUR_IDENTIFIER\n\nThen after payment send:\n/paid {oid} YOUR_PAYMENT_REFERENCE")
+    pay_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 I Paid — Submit Transaction ID", callback_data=f"payref:{oid}")],
+        [InlineKeyboardButton(text="❌ Cancel Order", callback_data=f"cancel:{oid}")]
+    ])
+    instructions = await get_setting("payment_instructions", "Binance Pay details are not configured yet. Please contact support.")
+    await c.message.answer(
+        f"🛒 <b>New Order</b>\n🧾 Order: #{oid}\n📦 Product: {name}\n🔢 Quantity: {qty}\n💰 Total: ${total:.2f}\n\n"
+        f"💳 <b>Payment Instructions</b>\n{instructions}\n\n"
+        "After paying the exact amount, tap the button below and send your Binance transaction/order reference.",
+        parse_mode="HTML", reply_markup=pay_kb)
+
+@dp.callback_query(F.data.startswith("qty:"))
+async def choose_quantity(c: CallbackQuery):
+    _, pid, qty = c.data.split(":", 2)
+    await create_customer_order(c, pid, int(qty))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("qtycustom:"))
+async def custom_quantity(c: CallbackQuery):
+    pid = c.data.split(":", 1)[1]
+    try: p = await get_product(pid)
+    except VenteBotError as e: await c.message.answer(f"⚠️ {e}"); return await c.answer()
+    price = await display_price(p) if p else None
+    if not p or price is None: await c.message.answer("Product/price is unavailable."); return await c.answer()
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,product_id,unit_price_usd,product_name) VALUES(?,?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=NULL,product_id=excluded.product_id,unit_price_usd=excluded.unit_price_usd,product_name=excluded.product_name,created_at=CURRENT_TIMESTAMP",
+                         (c.from_user.id,"custom_qty",pid,f"{price:.2f}",p.get("name") or p.get("title") or "Product")); await db.commit()
+    await c.message.answer("🔢 Send the quantity you want as a number (example: 8).")
+    await c.answer()
+
+@dp.callback_query(F.data == "order:cancel")
+async def cancel_menu(c: CallbackQuery):
+    await c.message.answer("❌ Purchase cancelled.")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("cancel:"))
+async def cancel_order(c: CallbackQuery):
+    oid=int(c.data.split(":",1)[1])
+    async with aiosqlite.connect(DB) as db:
+        cur=await db.execute("UPDATE orders SET status='cancelled' WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(oid,c.from_user.id)); await db.commit()
+    await c.message.answer("❌ Order cancelled." if cur.rowcount else "This order can no longer be cancelled.")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("payref:"))
+async def ask_payment_reference(c: CallbackQuery):
+    oid=int(c.data.split(":",1)[1])
+    async with aiosqlite.connect(DB) as db:
+        row=await (await db.execute("SELECT 1 FROM orders WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(oid,c.from_user.id))).fetchone()
+        if not row: await c.answer("Order is not awaiting payment.",show_alert=True); return
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,order_id) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=excluded.order_id,product_id=NULL,unit_price_usd=NULL,product_name=NULL,created_at=CURRENT_TIMESTAMP",(c.from_user.id,"payment_ref",oid)); await db.commit()
+    await c.message.answer(f"💳 Send the Binance Transaction ID / Order ID for Order #{oid} in the message box now.")
     await c.answer()
 
 @dp.message(Command("activate"))
@@ -296,7 +300,7 @@ async def admin_pending(c: CallbackQuery):
         await c.message.answer("✅ No payments are waiting for approval.")
     else:
         for oid,uid,name,amount,ref,act in rows:
-            keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}", callback_data=f"admin:approve:{oid}")]])
+            keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}", callback_data=f"admin:approve:{oid}"), InlineKeyboardButton(text=f"❌ Reject #{oid}", callback_data=f"admin:reject:{oid}")]])
             await c.message.answer(f"🧾 #{oid} • {name or 'Product'}\\n👤 {uid}\\n💵 ${amount or '—'}\\n💳 Ref: {ref or '—'}\\n🔑 ID: {act or 'Not supplied'}", reply_markup=keys)
     await c.answer()
 
@@ -315,14 +319,47 @@ async def submit_supplier_order(oid: int):
         await db.execute("UPDATE orders SET supplier_order_id=?, status=? WHERE id=?", (supplier_id,status,oid)); await db.commit()
     return uid,supplier_id,status
 
+async def send_delivery_if_ready(bot: Bot, oid: int, uid: int, supplier_id: str):
+    if not supplier_id: return False
+    # Short polling window for instant-delivery products. Non-instant orders remain processing.
+    for delay in (0, 2, 4, 6):
+        if delay: await asyncio.sleep(delay)
+        try: result = await vente.order(supplier_id)
+        except VenteBotError: continue
+        data=(result.get("data") or {}) if isinstance(result,dict) else {}
+        status=(result.get("status") or data.get("status") or "processing") if isinstance(result,dict) else "processing"
+        delivery=(result.get("delivery") or result.get("credentials") or result.get("account") or data.get("delivery") or data.get("credentials") or data.get("account")) if isinstance(result,dict) else None
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("UPDATE orders SET status=? WHERE id=?",(str(status),oid)); await db.commit()
+        if delivery:
+            await bot.send_message(uid, f"🎉 <b>Order #{oid} Delivered</b>\n\n{delivery}", parse_mode="HTML")
+            return True
+    return False
+
 @dp.callback_query(F.data.startswith("admin:approve:"))
 async def admin_approve_button(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
     oid=int(c.data.rsplit(":",1)[1])
     try: uid,sid,status=await submit_supplier_order(oid)
-    except VenteBotError as e: return await c.message.answer(f"⚠️ Supplier order was NOT created: {e}")
-    await c.message.answer(f"✅ Order #{oid} submitted. Supplier ID: {sid or 'not returned'}")
-    try: await c.bot.send_message(uid, f"✅ Payment approved. Order #{oid} is processing. Status: {status}")
+    except VenteBotError as e: await c.message.answer(f"⚠️ Supplier order was NOT created: {e}"); return await c.answer()
+    await c.message.answer(f"✅ Payment approved. Order #{oid} sent to supplier. Supplier ID: {sid or 'not returned'}")
+    try:
+        await c.bot.send_message(uid, f"✅ Payment approved for Order #{oid}. Your product is now being processed.")
+        delivered = await send_delivery_if_ready(c.bot, oid, uid, sid)
+        if not delivered: await c.bot.send_message(uid, "⏳ Supplier is still processing this order. Delivery will appear when available.")
+    except Exception: pass
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:reject:"))
+async def admin_reject_button(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
+    oid=int(c.data.rsplit(":",1)[1])
+    async with aiosqlite.connect(DB) as db:
+        row=await (await db.execute("SELECT telegram_id FROM orders WHERE id=? AND status='payment_submitted'",(oid,))).fetchone()
+        if row: await db.execute("UPDATE orders SET status='payment_rejected' WHERE id=?",(oid,)); await db.commit()
+    if not row: await c.message.answer("Order is no longer pending."); return await c.answer()
+    await c.message.answer(f"❌ Payment for Order #{oid} rejected. No supplier order was created.")
+    try: await c.bot.send_message(row[0], f"❌ Payment for Order #{oid} could not be verified. Please contact support.")
     except Exception: pass
     await c.answer()
 
@@ -597,6 +634,44 @@ async def admin_stats(c: CallbackQuery):
         sales=(await (await db.execute("SELECT COALESCE(SUM(CAST(amount_usd AS REAL)),0) FROM orders WHERE status NOT IN ('awaiting_payment','payment_submitted','cancelled','failed')")).fetchone())[0]
         refs=(await (await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")).fetchone())[0]
     await c.message.answer(f"📊 Store Statistics\n👥 Users: {users}\n📦 Orders: {orders}\n⏳ Pending approvals: {pending}\n🎁 Referred users: {refs}\n💵 Processed order value: ${sales:.2f}"); await c.answer()
+
+@dp.message(F.text)
+async def pending_text_input(m: Message):
+    # Handles only text explicitly requested by a previous button (custom quantity / payment reference).
+    async with aiosqlite.connect(DB) as db:
+        state=await (await db.execute("SELECT action,order_id,product_id FROM user_input_state WHERE telegram_id=?",(m.from_user.id,))).fetchone()
+    if not state: return
+    action, oid, pid = state
+    text=(m.text or "").strip()
+    if action == "custom_qty":
+        if not text.isdigit() or not (1 <= int(text) <= 100):
+            return await m.answer("⚠️ Send a quantity from 1 to 100, for example: 8")
+        # Clear state first, then create the order through the same safe path.
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?",(m.from_user.id,)); await db.commit()
+        class MsgCallback:
+            from_user=m.from_user; message=m
+        await create_customer_order(MsgCallback(), pid, int(text))
+        return
+    if action == "payment_ref":
+        if len(text) < 4 or len(text) > 200:
+            return await m.answer("⚠️ Please send a valid Binance Transaction ID / Order ID.")
+        async with aiosqlite.connect(DB) as db:
+            duplicate=await (await db.execute("SELECT id FROM orders WHERE payment_reference=? AND id<>?",(text,oid))).fetchone()
+            if duplicate: return await m.answer("⚠️ This transaction reference has already been used. Please check it and send the correct one.")
+            cur=await db.execute("UPDATE orders SET payment_reference=?, status='payment_submitted' WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(text,oid,m.from_user.id))
+            if cur.rowcount: await db.execute("DELETE FROM user_input_state WHERE telegram_id=?",(m.from_user.id,))
+            await db.commit()
+        if not cur.rowcount: return await m.answer("⚠️ This order is no longer awaiting payment.")
+        await m.answer(f"✅ Transaction reference received for Order #{oid}.\n\n⏳ Payment is waiting for admin verification. The supplier will NOT be charged until you are approved.")
+        # Push the pending payment directly to every admin.
+        async with aiosqlite.connect(DB) as db:
+            row=await (await db.execute("SELECT product_name,amount_usd,activation_identifier FROM orders WHERE id=?",(oid,))).fetchone()
+        name,amount,act=row if row else ("Product","—",None)
+        keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}",callback_data=f"admin:approve:{oid}"),InlineKeyboardButton(text=f"❌ Reject #{oid}",callback_data=f"admin:reject:{oid}")]])
+        for admin_id in ADMIN_IDS:
+            try: await m.bot.send_message(admin_id,f"💳 <b>Payment submitted</b>\n🧾 Order #{oid}\n📦 {name}\n👤 {m.from_user.id}\n💵 ${amount}\n🔎 Ref: <code>{text}</code>\n🔑 ID: {act or 'Not supplied'}",parse_mode="HTML",reply_markup=keys)
+            except Exception: pass
 
 async def main():
     if not TOKEN or "PASTE_" in TOKEN: raise RuntimeError("Set BOT_TOKEN in .env before starting the bot.")
