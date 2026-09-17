@@ -348,14 +348,51 @@ async def admin_prices(c: CallbackQuery):
     if not items:
         await c.message.answer("🛍️ No products are currently available.")
         return await c.answer()
-    lines = ["💵 <b>Product Prices</b>", "", "Use <code>/setprice PRODUCT_ID USD_PRICE</code> or 🧾 Bulk Price Update.", ""]
+    rows = []
     for p in items[:30]:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
-        name = p.get("name") or p.get("title") or "Product"
+        if not pid:
+            continue
+        name = str(p.get("name") or p.get("title") or "Product")
         selling = await custom_price(pid)
         selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
-        lines.append(f"<b>{name}</b> | ID: <code>{pid}</code> | {selling_text}")
-    await c.message.answer("\n".join(lines), parse_mode="HTML")
+        stock = p.get("stock")
+        stock_text = f"📦 {stock}" if stock is not None else "📦 —"
+        label = f"{p.get('emoji') or '📦'} {name} | {selling_text} | {stock_text}"
+        if len(label) > 60:
+            label = f"{p.get('emoji') or '📦'} {name[:31].rstrip()}… | {selling_text} | {stock_text}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin:price_item:{pid}")])
+    rows.append([InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    await c.message.answer(
+        "💵 <b>Product Prices</b>\n\n"
+        "Tap a product to see its ID and price-setting command.",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:price_item:"))
+async def admin_price_item(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    pid = c.data.rsplit(":", 1)[-1]
+    try:
+        p = await get_product(pid)
+    except VenteBotError as e:
+        return await c.answer(f"Could not load product: {e}", show_alert=True)
+    if not p:
+        return await c.answer("Product not found", show_alert=True)
+    name = str(p.get("name") or p.get("title") or "Product")
+    selling = await custom_price(pid)
+    selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
+    await c.message.answer(
+        f"💵 <b>{name}</b>\n"
+        f"ID: <code>{pid}</code>\n"
+        f"Selling price: <b>{selling_text}</b>\n\n"
+        f"Set/change price with:\n<code>/setprice {pid} PRICE</code>",
+        parse_mode="HTML",
+    )
     await c.answer()
 
 
