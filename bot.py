@@ -185,9 +185,22 @@ async def products_back(c: CallbackQuery):
         return
     await c.answer()
 
+def clean_supplier_text(value):
+    import html
+    import re
+    text = str(value or "")
+    # Remove Telegram custom-emoji markup together with its fallback emoji.
+    text = re.sub(r'<tg-emoji\b[^>]*>.*?</tg-emoji>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    # Remove ordinary emoji/pictographs supplied in product text.
+    text = re.sub(r'[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]', '', text)
+    # Clean spacing left behind by removed markup/emoji.
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return html.escape(text)
+
 @dp.callback_query(F.data.startswith("product:"))
 async def product_details(c: CallbackQuery):
-    import html
     pid = c.data.split(":", 1)[1]
     try:
         p = await get_product(pid)
@@ -197,12 +210,12 @@ async def product_details(c: CallbackQuery):
     if not p:
         await c.answer("Product is no longer available.", show_alert=True)
         return
-    name = html.escape(str(p.get("name") or p.get("title") or "Product"))
-    description = html.escape(str(p.get("description") or ""))
+    name = clean_supplier_text(p.get("name") or p.get("title") or "Product")
+    description = clean_supplier_text(p.get("description") or "")
     stock = p.get("stock")
     price = await display_price(p)
     price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
-    text = f"{p.get('emoji') or '📦'} <b>{name}</b>\n💵 Price: {price_text}"
+    text = f"<b>{name}</b>\n💵 Price: {price_text}"
     if stock is not None:
         text += f"\n📦 Stock: {stock}"
     if description:
