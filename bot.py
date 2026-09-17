@@ -52,7 +52,7 @@ STOREBAT_PRODUCT_ORDER = [
     "Peacock official subscriptions 1year",
     "Wink - Wink Smile+ 7D (W5D)",
     "JetBrains EDU 1 year",
-    "Autodesk Admin Dashboard Access(3000 invite",
+    "Autodesk Admin Dashboard Access(3000 invitation)",
     "Quizlet",
     "wordwall PRO",
     "Brain.fm 1 Year",
@@ -91,19 +91,26 @@ STOREBAT_PRODUCT_ORDER = [
 def _catalog_key(text: str) -> str:
     return "".join(ch.lower() for ch in str(text) if ch.isalnum())
 
+def canonical_storebat_name(text: str):
+    key = _catalog_key(text)
+    for wanted in STOREBAT_PRODUCT_ORDER:
+        wanted_key = _catalog_key(wanted)
+        if key == wanted_key or (wanted_key and (key.startswith(wanted_key) or wanted_key.startswith(key))):
+            return wanted
+    return None
+
 def sort_storebat_products(items):
+    # Strict allow-list: only the 58 products approved by the admin are shown.
     order = {_catalog_key(name): i for i, name in enumerate(STOREBAT_PRODUCT_ORDER)}
-    def rank(p):
-        name = str(p.get("name") or p.get("title") or "")
-        key = _catalog_key(name)
-        if key in order:
-            return (order[key], name.lower())
-        # Prefix matching handles supplier labels that contain extra text after the visible name.
-        for wanted, idx in order.items():
-            if wanted and (key.startswith(wanted) or wanted.startswith(key)):
-                return (idx, name.lower())
-        return (len(order) + 1, name.lower())
-    return sorted(items, key=rank)
+    kept = []
+    for p in items:
+        supplier_name = str(p.get("name") or p.get("title") or "")
+        canonical = canonical_storebat_name(supplier_name)
+        if canonical is None:
+            continue
+        kept.append((order[_catalog_key(canonical)], p))
+    kept.sort(key=lambda x: x[0])
+    return [p for _, p in kept]
 
 
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
@@ -228,7 +235,7 @@ async def product_list_markup():
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
-        name = str(p.get("name") or p.get("title") or "Product")
+        name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
         label = f"{p.get('emoji') or '📦'} {name} — {price_text}"
@@ -439,7 +446,7 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
-        name = str(p.get("name") or p.get("title") or "Product")
+        name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
         selling = await custom_price(pid)
         selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
         stock = p.get("stock")
