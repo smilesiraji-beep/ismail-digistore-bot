@@ -650,6 +650,18 @@ async def admin_panel(m: Message):
     if m.from_user.id not in ADMIN_IDS: return
     await m.answer("⚙️ Ismail Digistore Admin", reply_markup=ADMIN_KB)
 
+def api_category_header(name: str):
+    """Only label Claude and Codex API products; leave all other products untouched."""
+    lowered = name.casefold()
+    if "api" not in lowered and "token" not in lowered:
+        return None
+    if "claude" in lowered:
+        return "📂 Claude API"
+    if "codex" in lowered:
+        return "📂 Codex API"
+    return None
+
+
 async def show_admin_prices(c: CallbackQuery, page: int = 0):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
@@ -668,7 +680,12 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
     page_items = items[page * page_size:(page + 1) * page_size]
 
     rows = []
+    last_category = None
     for p in page_items:
+        category = api_category_header(str(p.get("name") or p.get("title") or ""))
+        if category and category != last_category:
+            rows.append([InlineKeyboardButton(text=category, callback_data="admin:prices_noop")])
+        last_category = category
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
@@ -750,7 +767,12 @@ async def show_admin_edit_products(c: CallbackQuery, page: int = 0):
     pages = max(1, (len(items) + size - 1) // size)
     page = max(0, min(page, pages - 1))
     rows = []
+    last_category = None
     for product in items[page * size:(page + 1) * size]:
+        category = api_category_header(str(product.get("name") or product.get("title") or ""))
+        if category and category != last_category:
+            rows.append([InlineKeyboardButton(text=category, callback_data="admin:prices_noop")])
+        last_category = category
         pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
         if not pid:
             continue
