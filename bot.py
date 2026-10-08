@@ -2,14 +2,12 @@ import asyncio
 import os
 import json
 import uuid
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup, BufferedInputFile, InputMediaPhoto
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 from ventebot import VenteBotClient, VenteBotError, extract_products, money
@@ -328,86 +326,6 @@ def company_logo_id(product_name: str):
             return str(emoji_id)
     return None
 
-
-# Premium visual catalog: presentation only. Product IDs, prices and checkout
-# continue to come from the original VenteBot and display_price functions.
-def premium_card_image(name, price_text, position, total):
-    canvas = Image.new("RGB", (1000, 620), "#0B1220")
-    d = ImageDraw.Draw(canvas)
-    d.rounded_rectangle((34, 35, 966, 585), radius=32, fill="#172238", outline="#344762", width=3)
-    d.rounded_rectangle((70, 70, 365, 125), radius=18, fill="#243C5C")
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    def font(size):
-        try: return ImageFont.truetype(font_path, size)
-        except OSError: return ImageFont.load_default()
-    d.text((90, 84), "ISMAIL DIGISTORE", font=font(23), fill="#D8E9FF")
-    d.text((75, 155), "PREMIUM DIGITAL PRODUCT", font=font(24), fill="#89A5C6")
-    words = name.split()
-    lines, current = [], ""
-    for word in words:
-        candidate = (current + " " + word).strip()
-        if d.textbbox((0, 0), candidate, font=font(47))[2] > 835 and current:
-            lines.append(current); current = word
-        else: current = candidate
-    if current: lines.append(current)
-    for i, line in enumerate(lines[:3]):
-        d.text((75, 218+i*62), line, font=font(47), fill="#FFFFFF")
-    d.rounded_rectangle((75, 445, 425, 535), radius=22, fill="#1F715B")
-    d.text((102, 461), price_text, font=font(47), fill="#FFFFFF")
-    d.text((785, 522), f"{position}/{total}", font=font(24), fill="#AFC4DF")
-    out = BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
-
-async def premium_catalog_page(index):
-    products = sort_storebat_products(extract_products(await vente.products(lang="en")))
-    products = [p for p in products if p.get("id") or p.get("product_id") or p.get("uuid")]
-    if not products:
-        return None
-    index = max(0, min(index, len(products)-1))
-    p = products[index]
-    pid = str(p.get("id") or p.get("product_id") or p.get("uuid"))
-    name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
-    price = await display_price(p)
-    price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
-    controls = []
-    if isinstance(price, Decimal):
-        controls.append([InlineKeyboardButton(text="🛒 Buy Now", callback_data=f"buy:{pid}")])
-    nav = []
-    if index: nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"premium:{index-1}"))
-    nav.append(InlineKeyboardButton(text=f"{index+1}/{len(products)}", callback_data="premium:noop"))
-    if index+1 < len(products): nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"premium:{index+1}"))
-    controls.append(nav)
-    controls.append([InlineKeyboardButton(text="📋 View All Products", callback_data="premium:list")])
-    return (premium_card_image(name, price_text, index+1, len(products)),
-            f"💎 <b>{clean_supplier_text(name)}</b>\\n💵 {price_text}",
-            InlineKeyboardMarkup(inline_keyboard=controls))
-
-@dp.callback_query(F.data == "premium:noop")
-async def premium_noop(c: CallbackQuery):
-    await c.answer()
-
-@dp.callback_query(F.data == "premium:list")
-async def premium_to_list(c: CallbackQuery):
-    try:
-        markup = await product_list_markup()
-        await c.message.answer("🛍️ <b>All Products</b>", parse_mode="HTML", reply_markup=markup)
-        await c.answer()
-    except VenteBotError as e:
-        await c.answer(str(e), show_alert=True)
-
-@dp.callback_query(F.data.startswith("premium:"))
-async def premium_navigate(c: CallbackQuery):
-    try:
-        index = int(c.data.split(":", 1)[1])
-        page = await premium_catalog_page(index)
-        if not page: return await c.answer("No products available", show_alert=True)
-        photo, caption, markup = page
-        await c.message.edit_media(InputMediaPhoto(media=BufferedInputFile(photo, filename="product.png"), caption=caption, parse_mode="HTML"), reply_markup=markup)
-        await c.answer()
-    except (VenteBotError, ValueError) as e:
-        await c.answer(str(e), show_alert=True)
-
 async def product_list_markup():
     items = sort_storebat_products(extract_products(await vente.products(lang="en")))
     rows = []
@@ -437,15 +355,7 @@ async def products(m: Message):
     except VenteBotError as e:
         await m.answer(f"⚠️ Product catalog is not available yet.\n{e}")
         return
-    try:
-        page = await premium_catalog_page(0)
-        if page:
-            photo, caption, controls = page
-            await m.answer_photo(BufferedInputFile(photo, filename="product.png"), caption=caption, parse_mode="HTML", reply_markup=controls)
-            return
-    except (VenteBotError, OSError):
-        pass
-    await m.answer("🛍️ <b>Ismail Digistore</b>\\nChoose a product below:", parse_mode="HTML", reply_markup=markup)
+    await m.answer("🛍️ <b>Ismail Digistore</b>\nChoose a product below:", parse_mode="HTML", reply_markup=markup)
 
 @dp.callback_query(F.data == "products:refresh")
 async def products_refresh(c: CallbackQuery):
