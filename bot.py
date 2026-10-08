@@ -1,5 +1,6 @@
 import asyncio
 import os
+import json
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -21,9 +22,12 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 vente = VenteBotClient()
 
 kb = ReplyKeyboardMarkup(keyboard=[
-    [KeyboardButton(text="🛍️ Products"), KeyboardButton(text="🔥 Offers")],
-    [KeyboardButton(text="🎁 Referral Offers"), KeyboardButton(text="📦 My Orders")],
-    [KeyboardButton(text="💳 Payment"), KeyboardButton(text="💬 Support")],
+    [KeyboardButton(text="🛍️ Shop Products")],
+    [KeyboardButton(text="🔥 Special Offers"), KeyboardButton(text="🎁 Refer & Earn")],
+    [KeyboardButton(text="📦 My Orders"), KeyboardButton(text="🔎 Track Order")],
+    [KeyboardButton(text="💳 Payment Info"), KeyboardButton(text="💬 Support")],
+    [KeyboardButton(text="⭐ Reviews"), KeyboardButton(text="👤 My Account")],
+    [KeyboardButton(text="🌐 Visit Website"), KeyboardButton(text="📢 Main Channel")],
 ], resize_keyboard=True)
 
 dp = Dispatcher()
@@ -236,6 +240,64 @@ async def get_product(product_id: str):
             return p
     return None
 
+# Main-menu labels route to existing handlers; existing business logic is unchanged.
+@dp.message(F.text == "🛍️ Shop Products")
+async def menu_shop_products(m: Message):
+    await products(m)
+
+@dp.message(F.text == "🔥 Special Offers")
+async def menu_special_offers(m: Message):
+    await offers(m)
+
+@dp.message(F.text == "🎁 Refer & Earn")
+async def menu_refer_earn(m: Message):
+    await referrals(m)
+
+@dp.message(F.text == "💳 Payment Info")
+async def menu_payment_info(m: Message):
+    await payment(m)
+
+@dp.message(F.text == "📢 Main Channel")
+async def menu_main_channel(m: Message):
+    await m.answer("📢 Join our Main Channel:", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📢 Open Main Channel", url="https://t.me/ismaildigistore")]]))
+
+@dp.message(F.text == "🌐 Visit Website")
+async def menu_visit_website(m: Message):
+    url = (await get_setting("website_url", "")).strip()
+    if not url.startswith(("https://", "http://")):
+        return await m.answer("🌐 Our website link is not configured yet. Please contact support.")
+    await m.answer("🌐 Visit our website:", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🌐 Open Website", url=url)]]))
+
+@dp.message(F.text == "👤 My Account")
+async def menu_my_account(m: Message):
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END),0) FROM orders WHERE telegram_id=?",
+            (m.from_user.id,))).fetchone()
+    await m.answer(f"👤 My Account\\nID: {m.from_user.id}\\nOrders: {row[0]}\\nDelivered: {row[1]}")
+
+@dp.message(F.text == "🔎 Track Order")
+async def menu_track_order(m: Message):
+    await m.answer("🔎 To track an order, send /track ORDER_ID (example: /track 123).")
+
+@dp.message(Command("track"))
+async def menu_track_command(m: Message):
+    parts = (m.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        return await m.answer("Usage: /track ORDER_ID")
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT product_name,status,created_at FROM orders WHERE id=? AND telegram_id=?",
+            (int(parts[1]),m.from_user.id))).fetchone()
+    if not row: return await m.answer("Order not found in your account.")
+    await m.answer(f"🔎 Order #{parts[1]}\\n📦 {row[0]}\\n📌 Status: {row[1]}\\n🕒 {row[2]}")
+
+@dp.message(F.text == "⭐ Reviews")
+async def menu_reviews(m: Message):
+    await m.answer("⭐ Reviews are not configured yet. Please contact support.")
+
 @dp.message(CommandStart())
 async def start(m: Message):
     parts = (m.text or "").split(maxsplit=1)
@@ -250,6 +312,22 @@ async def start(m: Message):
         await db.commit()
     await m.answer("Welcome to Ismail Digistore! 🛍️\nChoose an option below.", reply_markup=kb)
 
+# Optional verified Telegram custom-emoji IDs for real company logos.
+# JSON mapping of company name -> Telegram custom emoji ID.
+# No placeholder IDs are sent to Telegram.
+def company_logo_id(product_name: str):
+    try:
+        logos = json.loads(os.getenv("PRODUCT_LOGO_EMOJI_IDS", "{}"))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(logos, dict):
+        return None
+    name = _catalog_key(product_name)
+    for company, emoji_id in sorted(logos.items(), key=lambda kv: len(str(kv[0])), reverse=True):
+        if _catalog_key(company) in name and str(emoji_id).isdigit():
+            return str(emoji_id)
+    return None
+
 async def product_list_markup():
     items = sort_storebat_products(extract_products(await vente.products(lang="en")))
     rows = []
@@ -260,10 +338,15 @@ async def product_list_markup():
         name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
-        label = f"{p.get('emoji') or '📦'} {name} — {price_text}"
+        logo_id = company_logo_id(name)
+        prefix = "" if logo_id else (p.get("emoji") or "📦") + " "
+        label = f"{prefix}{name} — {price_text}"
         if len(label) > 58:
-            label = f"{p.get('emoji') or '📦'} {name[:35].rstrip()}… — {price_text}"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"product:{pid}")])
+            label = f"{prefix}{name[:35].rstrip()}… — {price_text}"
+        button_options = {"text": label, "callback_data": f"product:{pid}"}
+        if logo_id:
+            button_options["icon_custom_emoji_id"] = logo_id
+        rows.append([InlineKeyboardButton(**button_options)])
     rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="products:refresh")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
