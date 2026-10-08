@@ -365,7 +365,7 @@ async def product_list_markup():
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
-        name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
+        name = str(p.get("name") or p.get("title") or "Product")
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
         logo_id = company_logo_id(name)
@@ -633,7 +633,7 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
-        name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "Product")
+        name = str(p.get("name") or p.get("title") or "Product")
         selling = await selling_price_for_product(p)
         selling_text = f"${selling:.2f}" if isinstance(selling, Decimal) else "Not set"
         stock = p.get("stock")
@@ -678,8 +678,54 @@ async def admin_product_add(c: CallbackQuery):
 async def admin_product_edit(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
+    await show_admin_edit_products(c, 0)
+
+
+async def show_admin_edit_products(c: CallbackQuery, page: int = 0):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    try:
+        items = await catalog_products()
+    except VenteBotError as e:
+        await c.message.answer(f"⚠️ Could not load products: {e}")
+        return await c.answer()
+    if not items:
+        await c.message.answer("No products are available for editing.")
+        return await c.answer()
+    size = 10
+    pages = max(1, (len(items) + size - 1) // size)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for product in items[page * size:(page + 1) * size]:
+        pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
+        if not pid:
+            continue
+        name = str(product.get("name") or product.get("title") or "Product")
+        rows.append([InlineKeyboardButton(text=f"✏️ {name[:52]}", callback_data=f"admin:manage:edit:{pid}")])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:edit_page:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="admin:prices_noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:edit_page:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔎 Search instead", callback_data="admin:edit_search")])
+    await c.message.answer(f"✏️ Edit Products ({len(items)} total)\nTap a product to change its name or price.",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:edit_page:"))
+async def admin_edit_page(c: CallbackQuery):
+    await show_admin_edit_products(c, int(c.data.rsplit(":", 1)[-1]))
+
+
+@dp.callback_query(F.data == "admin:edit_search")
+async def admin_edit_search(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
     await set_admin_product_state(c.from_user.id, "admin_edit_search")
-    await c.message.answer("✏️ Send a product name to find it for editing.")
+    await c.message.answer("🔎 Send a product name to search for editing.")
     await c.answer()
 
 
@@ -1386,7 +1432,7 @@ async def customer_search_results(m, term):
     except VenteBotError: return await m.answer("⚠️ Catalog is temporarily unavailable. Try again later.")
     matches=[]
     for product in items:
-        name=canonical_storebat_name(str(product.get("name") or product.get("title") or ""))
+        name=str(product.get("name") or product.get("title") or "")
         if name and term.casefold() in name.casefold(): matches.append((product,name))
     if not matches: return await m.answer("🔎 No matching products found. Try another keyword.")
     buttons=[]
