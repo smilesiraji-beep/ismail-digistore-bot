@@ -251,8 +251,10 @@ def group_products_by_name(items, overrides):
     first_seen = {}
     for index, item in enumerate(items):
         pid = str(item.get("id") or item.get("product_id") or item.get("uuid") or "")
-        family = product_family(item.get("name") or item.get("title") or "")
-        key = family or ("product:" + pid)
+        name = str(item.get("name") or item.get("title") or "")
+        api_group = api_category_header(name)
+        family = product_family(name)
+        key = ("api:" + api_group) if api_group else (family or ("product:" + pid))
         groups.setdefault(key, []).append(item)
         first_seen.setdefault(key, index)
 
@@ -407,16 +409,17 @@ async def product_list_markup():
             continue
         name = str(p.get("name") or p.get("title") or "Product")
         category = api_category_header(name)
-        category_prefix = f"{category} · " if category and category != last_category else ""
+        if category and category != last_category:
+            rows.append([InlineKeyboardButton(text=category, callback_data="products:category_noop")])
         last_category = category
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
         logo_id = company_logo_id(name)
         prefix = "" if logo_id else (p.get("emoji") or "📦") + " "
-        label = f"{category_prefix}{prefix}{name} — {price_text}"
+        label = f"{prefix}{name} — {price_text}"
         if len(label) > 58:
-            max_name = max(8, 55 - len(category_prefix) - len(prefix) - len(price_text))
-            label = f"{category_prefix}{prefix}{name[:max_name].rstrip()}… — {price_text}"
+            max_name = max(8, 55 - len(prefix) - len(price_text))
+            label = f"{prefix}{name[:max_name].rstrip()}… — {price_text}"
         button_options = {"text": label, "callback_data": f"product:{pid}"}
         if logo_id:
             button_options["icon_custom_emoji_id"] = logo_id
@@ -692,7 +695,8 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
     last_category = None
     for p in page_items:
         category = api_category_header(str(p.get("name") or p.get("title") or ""))
-        category_prefix = f"{category} · " if category and category != last_category else ""
+        if category and category != last_category:
+            rows.append([InlineKeyboardButton(text=category, callback_data="admin:prices_noop")])
         last_category = category
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
@@ -703,10 +707,10 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
         stock = p.get("stock")
         stock_text = f"📦 {stock}" if stock is not None else "📦 —"
         emoji = p.get("emoji") or "📦"
-        label = f"{category_prefix}{emoji} {name} | {selling_text} | {stock_text}"
+        label = f"{emoji} {name} | {selling_text} | {stock_text}"
         if len(label) > 60:
-            max_name = max(8, 56 - len(category_prefix) - len(selling_text) - len(stock_text))
-            label = f"{category_prefix}{emoji} {name[:max_name].rstrip()}… | {selling_text} | {stock_text}"
+            max_name = max(8, 56 - len(selling_text) - len(stock_text))
+            label = f"{emoji} {name[:max_name].rstrip()}… | {selling_text} | {stock_text}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"admin:price_item:{pid}")])
 
     nav = []
@@ -779,13 +783,14 @@ async def show_admin_edit_products(c: CallbackQuery, page: int = 0):
     last_category = None
     for product in items[page * size:(page + 1) * size]:
         category = api_category_header(str(product.get("name") or product.get("title") or ""))
-        category_prefix = f"{category} · " if category and category != last_category else ""
+        if category and category != last_category:
+            rows.append([InlineKeyboardButton(text=category, callback_data="admin:prices_noop")])
         last_category = category
         pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
         if not pid:
             continue
         name = str(product.get("name") or product.get("title") or "Product")
-        rows.append([InlineKeyboardButton(text=f"{category_prefix}✏️ {name[:max(8, 52-len(category_prefix))]}", callback_data=f"admin:manage:edit:{pid}")])
+        rows.append([InlineKeyboardButton(text=f"✏️ {name[:52]}", callback_data=f"admin:manage:edit:{pid}")])
     nav = []
     if page:
         nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:edit_page:{page-1}"))
