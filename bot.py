@@ -198,6 +198,9 @@ async def init_db():
         for name, ddl in {"product_name":"TEXT", "starts_at":"TEXT", "ends_at":"TEXT"}.items():
             if name not in ref_cols:
                 await db.execute(f"ALTER TABLE referral_campaigns ADD COLUMN {name} {ddl}")
+        managed_cols = {r[1] for r in await (await db.execute("PRAGMA table_info(managed_products)")).fetchall()}
+        if "pin_order" not in managed_cols:
+            await db.execute("ALTER TABLE managed_products ADD COLUMN pin_order INTEGER NOT NULL DEFAULT 0")
         await db.commit()
 
 async def get_setting(key: str, default=None):
@@ -239,8 +242,8 @@ async def catalog_products():
     """Preserve original approved products, with admin-added supplier IDs and visibility overrides."""
     raw = extract_products(await vente.products(lang="en"))
     async with aiosqlite.connect(DB) as db:
-        rows = await (await db.execute("SELECT product_id,display_name,enabled FROM managed_products")).fetchall()
-    overrides = {str(pid): (name, enabled) for pid, name, enabled in rows}
+        rows = await (await db.execute("SELECT product_id,display_name,enabled,pin_order FROM managed_products")).fetchall()
+    overrides = {str(pid): (name, enabled, pin_order) for pid, name, enabled, pin_order in rows}
     selected = []
     for product in raw:
         pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
@@ -252,6 +255,8 @@ async def catalog_products():
             item = dict(product)
             item["name"] = (record[0] if record and record[0] else canonical_storebat_name(original) or original)
             selected.append(item)
+    # Pinned products appear first; newest pin is first. All others keep supplier order.
+    selected.sort(key=lambda item: -(overrides.get(str(item.get("id") or item.get("product_id") or item.get("uuid") or ""), (None, 1, 0))[2] or 0))
     return selected
 
 
@@ -794,11 +799,42 @@ async def admin_manage_select(c: CallbackQuery):
             await db.commit()
         await c.message.answer(f"✅ Product added to your catalog: {name}\\nSet its selling price from Product Management before selling.")
     elif mode == "edit":
+        async with aiosqlite.connect(DB) as db:
+            pin_row = await (await db.execute("SELECT pin_order FROM managed_products WHERE product_id=?", (pid,))).fetchone()
+        is_pinned = bool(pin_row and pin_row[0])
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💵 Edit Price", callback_data=f"admin:price_item:{pid}")],
             [InlineKeyboardButton(text="✏️ Rename Product", callback_data=f"admin:rename:{pid}")],
+            [InlineKeyboardButton(text="↩️ Remove from Top" if is_pinned else "📌 Pin to Top", callback_data=f"admin:unpin:{pid}" if is_pinned else f"admin:pin:{pid}")],
             [InlineKeyboardButton(text="🙈 Hide Product", callback_data=f"admin:hide:{pid}")]])
         await c.message.answer(f"✏️ Edit: {name}", reply_markup=keyboard)
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:pin:") | F.data.startswith("admin:unpin:"))
+async def admin_pin_product(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    action, pid = c.data.split(":", 2)[1:]
+    try:
+        product = await get_product(pid)
+    except VenteBotError:
+        return await c.answer("Supplier API unavailable", show_alert=True)
+    if not product:
+        return await c.answer("Product not found", show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        if action == "pin":
+            row = await (await db.execute("SELECT COALESCE(MAX(pin_order), 0) FROM managed_products")).fetchone()
+            next_order = int(row[0]) + 1
+            await db.execute("INSERT INTO managed_products(product_id,pin_order) VALUES(?,?) "
+                             "ON CONFLICT(product_id) DO UPDATE SET pin_order=excluded.pin_order", (pid, next_order))
+        else:
+            await db.execute("UPDATE managed_products SET pin_order=0 WHERE product_id=?", (pid,))
+        await db.commit()
+    label = "📌 Pinned to top" if action == "pin" else "↩️ Removed from top"
+    await c.message.edit_text(f"{label}: {str(product.get('name') or product.get('title') or 'Product')}\nReturn to All Products / Edit to continue.",
+                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                  [InlineKeyboardButton(text="📋 All Products / Edit", callback_data="admin:product_edit")]]))
     await c.answer()
 
 
