@@ -264,11 +264,8 @@ async def menu_main_channel(m: Message):
 
 @dp.message(F.text == "🌐 Visit Website")
 async def menu_visit_website(m: Message):
-    url = (await get_setting("website_url", "")).strip()
-    if not url.startswith(("https://", "http://")):
-        return await m.answer("🌐 Our website link is not configured yet. Please contact support.")
     await m.answer("🌐 Visit our website:", reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🌐 Open Website", url=url)]]))
+        inline_keyboard=[[InlineKeyboardButton(text="🌐 Open Website", url="https://ismaildigistore.xyz/")]]))
 
 @dp.message(F.text == "👤 My Account")
 async def menu_my_account(m: Message):
@@ -296,7 +293,8 @@ async def menu_track_command(m: Message):
 
 @dp.message(F.text == "⭐ Reviews")
 async def menu_reviews(m: Message):
-    await m.answer("⭐ Reviews are not configured yet. Please contact support.")
+    await m.answer("⭐ Customer reviews are on our Telegram channel:", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⭐ Open Reviews Channel", url="https://t.me/ismaildigistore")]]))
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -1099,8 +1097,8 @@ async def setsupport(m: Message):
 
 @dp.message(F.text == "💬 Support")
 async def support(m: Message):
-    text=await get_setting("support_contact","Support contact has not been configured yet.")
-    await m.answer(f"💬 Support\n\n{text}")
+    await m.answer("💬 Contact our support team:", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="💬 Contact Support", url="https://t.me/Ismail0987651")]]))
 
 @dp.message(Command("broadcast"))
 async def broadcast(m: Message):
