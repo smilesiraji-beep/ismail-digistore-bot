@@ -1,7 +1,7 @@
 import asyncio
 import os
 import uuid
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -14,6 +14,9 @@ from ventebot import VenteBotClient, VenteBotError, extract_products, money
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 DB = os.getenv("DB_PATH", "digistore.db")
+BKASH_NUMBER = os.getenv("BKASH_NUMBER", "01785477501")
+NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "01785477501")
+BDT_PER_USD = "131"  # Fixed local checkout conversion rate; Binance remains in USD
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 vente = VenteBotClient()
 
@@ -146,7 +149,7 @@ async def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL,
           product_id TEXT NOT NULL, product_name TEXT, quantity INTEGER DEFAULT 1,
           amount_usd TEXT, supplier_order_id TEXT, status TEXT DEFAULT 'awaiting_payment',
-          activation_identifier TEXT, payment_reference TEXT,
+          activation_identifier TEXT, payment_reference TEXT, payment_method TEXT DEFAULT 'binance',
           idempotency_key TEXT UNIQUE, created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS referral_campaigns(
@@ -179,7 +182,7 @@ async def init_db():
         cols = {r[1] for r in await (await db.execute("PRAGMA table_info(orders)")).fetchall()}
         for name, ddl in {
             "product_name": "TEXT", "activation_identifier": "TEXT",
-            "payment_reference": "TEXT", "idempotency_key": "TEXT"
+            "payment_reference": "TEXT", "payment_method": "TEXT DEFAULT 'binance'", "idempotency_key": "TEXT"
         }.items():
             if name not in cols:
                 await db.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
@@ -373,16 +376,64 @@ async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
         cur = await db.execute("INSERT INTO orders(telegram_id,product_id,product_name,quantity,amount_usd,idempotency_key) VALUES(?,?,?,?,?,?)",
                                (c.from_user.id, pid, name, qty, f"{total:.2f}", idem))
         oid = cur.lastrowid; await db.commit()
-    pay_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 I Paid — Submit Transaction ID", callback_data=f"payref:{oid}")],
+    await c.message.answer(
+        f"🛒 <b>New Order</b>\\n🧾 Order: #{oid}\\n📦 Product: {name}\\n🔢 Quantity: {qty}\\n💰 Total: ${total:.2f}\\n\\n"
+        "💳 Select your payment method:",
+        parse_mode="HTML", reply_markup=payment_method_keyboard(oid))
+
+def payment_method_keyboard(oid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌍 International Payment — Binance Pay", callback_data=f"method:{oid}:binance")],
+        [InlineKeyboardButton(text="🇧🇩 Local Payment — bKash", callback_data=f"method:{oid}:bkash"),
+         InlineKeyboardButton(text="🇧🇩 Local Payment — Nagad", callback_data=f"method:{oid}:nagad")],
         [InlineKeyboardButton(text="❌ Cancel Order", callback_data=f"cancel:{oid}")]
     ])
-    instructions = await get_setting("payment_instructions", "Binance Pay details are not configured yet. Please contact support.")
-    await c.message.answer(
-        f"🛒 <b>New Order</b>\n🧾 Order: #{oid}\n📦 Product: {name}\n🔢 Quantity: {qty}\n💰 Total: ${total:.2f}\n\n"
-        f"💳 <b>Payment Instructions</b>\n{instructions}\n\n"
-        "After paying the exact amount, tap the button below and send your Binance transaction/order reference.",
-        parse_mode="HTML", reply_markup=pay_kb)
+
+def local_total(amount_usd):
+    try:
+        rate = Decimal(BDT_PER_USD)
+        if not rate.is_finite() or rate <= 0: return None
+        return (Decimal(str(amount_usd)) * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+@dp.callback_query(F.data.startswith("method:"))
+async def select_payment_method(c: CallbackQuery):
+    _, oid_text, method = c.data.split(":")
+    oid = int(oid_text)
+    if method not in ("binance", "bkash", "nagad"):
+        return await c.answer("Invalid payment method.", show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute("SELECT amount_usd FROM orders WHERE id=? AND telegram_id=? AND status='awaiting_payment'", (oid,c.from_user.id))).fetchone()
+        if not row: return await c.answer("Order not awaiting payment.", show_alert=True)
+        if method != "binance" and local_total(row[0]) is None:
+            return await c.answer("Local payment rate is not configured. Please contact support.", show_alert=True)
+        await db.execute("UPDATE orders SET payment_method=? WHERE id=? AND telegram_id=? AND status='awaiting_payment'", (method,oid,c.from_user.id))
+        await db.commit()
+    if method == "binance":
+        instructions = await get_setting("payment_instructions", "Binance Pay details are not configured yet. Please contact support.")
+        details = f"🌍 <b>International Payment — Binance Pay</b>\\n💰 Amount: ${row[0]}\\n\\n{instructions}"
+    else:
+        name, number = ("bKash", BKASH_NUMBER) if method == "bkash" else ("Nagad", NAGAD_NUMBER)
+        details = (f"🇧🇩 <b>Local Payment — {name}</b>\\n"
+                   f"💰 Send Money amount: ৳{local_total(row[0])}\\n"
+                   f"📱 Personal number: <code>{number}</code>\\n\\n"
+                   "Send Money to the number above, then submit your Transaction ID. "
+                   "Payment must be verified by the admin before delivery.")
+    keys = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ I Paid — Submit Transaction ID", callback_data=f"payref:{oid}")],
+        [InlineKeyboardButton(text="⬅️ Change Method", callback_data=f"methods:{oid}")]])
+    await c.message.answer(f"🧾 Order #{oid}\\n\\n{details}", parse_mode="HTML", reply_markup=keys)
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("methods:"))
+async def change_payment_method(c: CallbackQuery):
+    oid=int(c.data.split(":")[1])
+    async with aiosqlite.connect(DB) as db:
+        row=await (await db.execute("SELECT 1 FROM orders WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(oid,c.from_user.id))).fetchone()
+    if not row: return await c.answer("Order not awaiting payment.", show_alert=True)
+    await c.message.answer("💳 Select Payment Method:",reply_markup=payment_method_keyboard(oid))
+    await c.answer()
 
 @dp.callback_query(F.data.startswith("qty:"))
 async def choose_quantity(c: CallbackQuery):
@@ -420,10 +471,10 @@ async def cancel_order(c: CallbackQuery):
 async def ask_payment_reference(c: CallbackQuery):
     oid=int(c.data.split(":",1)[1])
     async with aiosqlite.connect(DB) as db:
-        row=await (await db.execute("SELECT 1 FROM orders WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(oid,c.from_user.id))).fetchone()
+        row=await (await db.execute("SELECT payment_method FROM orders WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(oid,c.from_user.id))).fetchone()
         if not row: await c.answer("Order is not awaiting payment.",show_alert=True); return
         await db.execute("INSERT INTO user_input_state(telegram_id,action,order_id) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=excluded.order_id,product_id=NULL,unit_price_usd=NULL,product_name=NULL,created_at=CURRENT_TIMESTAMP",(c.from_user.id,"payment_ref",oid)); await db.commit()
-    await c.message.answer(f"💳 Send the Binance Transaction ID / Order ID for Order #{oid} in the message box now.")
+    await c.message.answer(f"💳 Send the {dict(binance='Binance Transaction ID / Order ID', bkash='bKash Transaction ID', nagad='Nagad Transaction ID').get(row[0] or 'binance', 'Transaction ID')} for Order #{oid} in the message box now.")
     await c.answer()
 
 @dp.message(Command("activate"))
@@ -548,13 +599,13 @@ async def admin_price_item(c: CallbackQuery):
 async def admin_pending(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
     async with aiosqlite.connect(DB) as db:
-        rows = await (await db.execute("SELECT id,telegram_id,product_name,amount_usd,payment_reference,activation_identifier FROM orders WHERE status='payment_submitted' ORDER BY id LIMIT 20")).fetchall()
+        rows = await (await db.execute("SELECT id,telegram_id,product_name,amount_usd,payment_reference,activation_identifier,payment_method FROM orders WHERE status='payment_submitted' ORDER BY id LIMIT 20")).fetchall()
     if not rows:
         await c.message.answer("✅ No payments are waiting for approval.")
     else:
-        for oid,uid,name,amount,ref,act in rows:
+        for oid,uid,name,amount,ref,act,method in rows:
             keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}", callback_data=f"admin:approve:{oid}"), InlineKeyboardButton(text=f"❌ Reject #{oid}", callback_data=f"admin:reject:{oid}")]])
-            await c.message.answer(f"🧾 #{oid} • {name or 'Product'}\\n👤 {uid}\\n💵 ${amount or '—'}\\n💳 Ref: {ref or '—'}\\n🔑 ID: {act or 'Not supplied'}", reply_markup=keys)
+            await c.message.answer(f"🧾 #{oid} • {name or 'Product'}\\n👤 {uid}\\n💵 ${amount or '—'}\\n💳 {method or 'binance'} Ref: {ref or '—'}\\n🔑 ID: {act or 'Not supplied'}", reply_markup=keys)
     await c.answer()
 
 async def submit_supplier_order(oid: int):
@@ -974,7 +1025,7 @@ async def pending_text_input(m: Message):
         return
     if action == "payment_ref":
         if len(text) < 4 or len(text) > 200:
-            return await m.answer("⚠️ Please send a valid Binance Transaction ID / Order ID.")
+            return await m.answer("⚠️ Please send a valid payment Transaction ID / Order ID.")
         async with aiosqlite.connect(DB) as db:
             duplicate=await (await db.execute("SELECT id FROM orders WHERE payment_reference=? AND id<>?",(text,oid))).fetchone()
             if duplicate: return await m.answer("⚠️ This transaction reference has already been used. Please check it and send the correct one.")
@@ -985,8 +1036,8 @@ async def pending_text_input(m: Message):
         await m.answer(f"✅ Transaction reference received for Order #{oid}.\n\n⏳ Payment is waiting for admin verification. The supplier will NOT be charged until you are approved.")
         # Push the pending payment directly to every admin.
         async with aiosqlite.connect(DB) as db:
-            row=await (await db.execute("SELECT product_name,amount_usd,activation_identifier FROM orders WHERE id=?",(oid,))).fetchone()
-        name,amount,act=row if row else ("Product","—",None)
+            row=await (await db.execute("SELECT product_name,amount_usd,activation_identifier,payment_method FROM orders WHERE id=?",(oid,))).fetchone()
+        name,amount,act,method=row if row else ("Product","—",None,"binance")
         keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}",callback_data=f"admin:approve:{oid}"),InlineKeyboardButton(text=f"❌ Reject #{oid}",callback_data=f"admin:reject:{oid}")]])
         for admin_id in ADMIN_IDS:
             try: await m.bot.send_message(admin_id,f"💳 <b>Payment submitted</b>\n🧾 Order #{oid}\n📦 {name}\n👤 {m.from_user.id}\n💵 ${amount}\n🔎 Ref: <code>{text}</code>\n🔑 ID: {act or 'Not supplied'}",parse_mode="HTML",reply_markup=keys)
