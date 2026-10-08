@@ -126,7 +126,8 @@ def sort_storebat_products(items):
 
 
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices"), InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")],
+    [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
+    [InlineKeyboardButton(text="📦 All Orders", callback_data="admin:all_orders:0")],
     [InlineKeyboardButton(text="📦 Pending Payments", callback_data="admin:pending")],
     [InlineKeyboardButton(text="🎁 Referral Campaigns", callback_data="admin:ref_help")],
     [InlineKeyboardButton(text="💳 Payment Settings", callback_data="admin:payment_help")],
@@ -533,7 +534,6 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:prices_page:{page+1}"))
     rows.append(nav)
-    rows.append([InlineKeyboardButton(text="🧾 Bulk Price Update", callback_data="admin:bulk_prices")])
 
     text = (
         "💵 <b>Product Prices</b>\n\n"
@@ -594,6 +594,49 @@ async def admin_price_item(c: CallbackQuery):
     )
     await c.answer()
 
+
+@dp.callback_query(F.data.startswith("admin:all_orders:"))
+async def admin_all_orders(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    try:
+        page = max(0, int(c.data.rsplit(":", 1)[1]))
+    except ValueError:
+        return await c.answer("Invalid page.", show_alert=True)
+    per_page = 5
+    async with aiosqlite.connect(DB) as db:
+        total = (await (await db.execute("SELECT COUNT(*) FROM orders")).fetchone())[0]
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, pages - 1)
+        rows = await (await db.execute(
+            "SELECT id,telegram_id,product_name,quantity,amount_usd,status,payment_method,payment_reference,created_at "
+            "FROM orders ORDER BY id DESC LIMIT ? OFFSET ?",
+            (per_page, page * per_page))).fetchall()
+    lines = [f"📦 All Orders — Page {page + 1}/{pages} (Total: {total})"]
+    for oid, uid, product, qty, usd, status, method, ref, created in rows:
+        lines.append(
+            f"\\n🧾 #{oid} | {status or 'unknown'}"
+            f"\\n📦 {product or 'Product'} × {qty or 1}"
+            f"\\n👤 {uid} | 💵 ${usd or '0'}"
+            f"\\n💳 {method or 'binance'} | Ref: {ref or '—'}"
+            f"\\n🕒 {created or '—'}")
+    if not rows:
+        lines.append("\\nNo orders yet.")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:all_orders:{page-1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:all_orders:{page+1}"))
+    keys = ([nav] if nav else []) + [[InlineKeyboardButton(text="🔙 Admin Menu", callback_data="admin:all_orders_back")]]
+    await c.message.edit_text("\\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keys))
+    await c.answer()
+
+@dp.callback_query(F.data == "admin:all_orders_back")
+async def admin_all_orders_back(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    await c.message.edit_text("⚙️ Ismail Digistore Admin", reply_markup=ADMIN_KB)
+    await c.answer()
 
 @dp.callback_query(F.data == "admin:pending")
 async def admin_pending(c: CallbackQuery):
@@ -756,53 +799,6 @@ async def admin_payment_help(c: CallbackQuery):
     current=await get_setting("payment_instructions", "Not configured")
     await c.message.answer(f"💳 Current payment instructions:\n{current}\n\nChange with:\n/setpayment YOUR_PAYMENT_INSTRUCTIONS")
     await c.answer()
-
-@dp.callback_query(F.data == "admin:bulk_prices")
-async def admin_bulk_prices(c: CallbackQuery):
-    if c.from_user.id not in ADMIN_IDS:
-        return await c.answer("Not authorized", show_alert=True)
-    await c.message.answer(
-        "🧾 Bulk Price Update\n\nSend one message in this format:\n\n"
-        "/bulkprice\n105=1.50\n130=12.00\n93=2.00\n\n"
-        "Use PRODUCT_ID=USD_PRICE on each line."
-    )
-    await c.answer()
-
-@dp.message(Command("bulkprice"))
-async def bulkprice(m: Message):
-    if m.from_user.id not in ADMIN_IDS:
-        return
-    lines = (m.text or "").splitlines()[1:]
-    updates = []
-    errors = []
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
-        if "=" not in line:
-            errors.append(line)
-            continue
-        pid, price_text = [x.strip() for x in line.split("=", 1)]
-        try:
-            val = Decimal(price_text)
-            if not pid or val < 0:
-                raise InvalidOperation
-            updates.append((pid, f"{val:.2f}"))
-        except (InvalidOperation, ValueError):
-            errors.append(line)
-    if not updates:
-        return await m.answer("⚠️ No valid prices found. Use:\n/bulkprice\n105=1.50\n130=12.00")
-    async with aiosqlite.connect(DB) as db:
-        await db.executemany(
-            "INSERT INTO prices(product_id,selling_price_usd) VALUES(?,?) "
-            "ON CONFLICT(product_id) DO UPDATE SET selling_price_usd=excluded.selling_price_usd",
-            updates,
-        )
-        await db.commit()
-    text = f"✅ {len(updates)} product price(s) updated successfully."
-    if errors:
-        text += "\n⚠️ Skipped invalid line(s): " + ", ".join(errors[:10])
-    await m.answer(text)
 
 @dp.message(Command("setprice"))
 async def setprice(m: Message):
