@@ -303,6 +303,9 @@ async def get_product(product_id: str):
 # Main-menu labels route to existing handlers; existing business logic is unchanged.
 @dp.message(F.text == "🛍️ Shop Products")
 async def menu_shop_products(m: Message):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action LIKE 'admin_%'", (m.from_user.id,))
+        await db.commit()
     await products(m)
 
 @dp.message(F.text == "🔥 Special Offers")
@@ -1507,6 +1510,9 @@ async def customer_search_cancel(m: Message):
 async def customer_search_command(m: Message):
     term=(m.text or "").partition(" ")[2].strip()
     if not term: return await m.answer("Use /search PRODUCT_NAME")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action LIKE 'admin_%'",(m.from_user.id,))
+        await db.commit()
     await customer_search_results(m,term)
 
 async def customer_search_results(m, term):
@@ -1547,6 +1553,31 @@ async def admin_sales_dashboard(c: CallbackQuery):
                            f"💵 Processed order value: ${sales:.2f}\n\n🏆 Top products (processed orders):\n{ranking}")
     await c.answer()
 
+@dp.message(Command("cancelprice"))
+async def cancel_price_command(m: Message):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action IN ('admin_set_price','admin_confirm_price')",(m.from_user.id,))
+        await db.commit()
+    await m.answer("❌ Price edit cancelled. No price was changed.")
+
+
+@dp.callback_query(F.data.in_({"admin:price_confirm", "admin:price_cancel"}))
+async def admin_price_confirm_or_cancel(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized",show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        state=await (await db.execute("SELECT product_id,unit_price_usd FROM user_input_state WHERE telegram_id=? AND action='admin_confirm_price'",(c.from_user.id,))).fetchone()
+        if not state:
+            return await c.answer("No pending price edit",show_alert=True)
+        pid, amount=state
+        if c.data == "admin:price_confirm":
+            await db.execute("INSERT INTO prices(product_id,selling_price_usd) VALUES(?,?) ON CONFLICT(product_id) DO UPDATE SET selling_price_usd=excluded.selling_price_usd",(pid,amount))
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action='admin_confirm_price'",(c.from_user.id,))
+        await db.commit()
+    await c.message.edit_text((f"✅ Confirmed: product ID {pid} price changed to ${amount}." if c.data == "admin:price_confirm" else "❌ Price edit cancelled. No changes made."))
+    await c.answer()
+
+
 @dp.message(F.text)
 async def pending_text_input(m: Message):
     # Handles only text explicitly requested by a previous button (custom quantity / payment reference).
@@ -1574,24 +1605,29 @@ async def pending_text_input(m: Message):
     if action == "admin_price_search":
         return await admin_price_search_results(m,text)
     if action == "admin_set_price":
-        if m.from_user.id not in ADMIN_IDS:
-            return
+        if m.from_user.id not in ADMIN_IDS: return
         try:
             val = Decimal(text)
-            if val < 0:
-                raise InvalidOperation
+            if not val.is_finite() or val < 0: raise InvalidOperation
         except (InvalidOperation, ValueError):
-            return await m.answer("⚠️ Send a valid USD price, for example: 8.00")
+            return await m.answer("⚠️ Enter a valid USD price, or /cancelprice to stop.")
+        try:
+            product = await get_product(pid)
+            name = str(product.get("name") or product.get("title") or pid) if product else pid
+            old = await selling_price_for_product(product) if product else None
+        except VenteBotError:
+            return await m.answer("⚠️ Supplier unavailable; no price changed.")
         async with aiosqlite.connect(DB) as db:
-            await db.execute(
-                "INSERT INTO prices(product_id,selling_price_usd) VALUES(?,?) "
-                "ON CONFLICT(product_id) DO UPDATE SET selling_price_usd=excluded.selling_price_usd",
-                (pid, f"{val:.2f}"),
-            )
-            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?", (m.from_user.id,))
+            await db.execute("UPDATE user_input_state SET action='admin_confirm_price',unit_price_usd=? WHERE telegram_id=? AND action='admin_set_price' AND product_id=?", (f"{val:.2f}",m.from_user.id,pid))
             await db.commit()
-        await m.answer(f"✅ Selling price updated to ${val:.2f}.")
+        old_text = f"${old:.2f}" if isinstance(old,Decimal) else "Not set"
+        await m.answer(f"⚠️ Confirm price change\n📦 Product: {name}\n💵 Old price: {old_text}\n💵 New price: ${val:.2f}\n\nNo change until you confirm.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Confirm price change",callback_data="admin:price_confirm")],
+                [InlineKeyboardButton(text="❌ Cancel",callback_data="admin:price_cancel")]]))
         return
+    if action == "admin_confirm_price":
+        return await m.answer("⚠️ Price change is awaiting confirmation. Use the Confirm or Cancel button above.")
     if action == "custom_qty":
         if not text.isdigit() or not (1 <= int(text) <= 100):
             return await m.answer("⚠️ Send a quantity from 1 to 100, for example: 8")
