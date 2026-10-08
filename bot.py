@@ -23,6 +23,7 @@ vente = VenteBotClient()
 
 kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🛍️ Shop Products")],
+    [KeyboardButton(text="🔎 Search Products")],
     [KeyboardButton(text="🔥 Special Offers"), KeyboardButton(text="🎁 Refer & Earn")],
     [KeyboardButton(text="📦 My Orders"), KeyboardButton(text="🔎 Track Order")],
     [KeyboardButton(text="💳 Payment Info"), KeyboardButton(text="💬 Support")],
@@ -130,12 +131,14 @@ def sort_storebat_products(items):
 
 
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="➕ Add Product", callback_data="admin:product_add"), InlineKeyboardButton(text="✏️ Edit Product", callback_data="admin:product_edit")],
     [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
     [InlineKeyboardButton(text="📦 All Orders", callback_data="admin:all_orders:0")],
     [InlineKeyboardButton(text="📦 Pending Payments", callback_data="admin:pending")],
     [InlineKeyboardButton(text="🎁 Referral Campaigns", callback_data="admin:ref_help")],
     [InlineKeyboardButton(text="💳 Payment Settings", callback_data="admin:payment_help")],
     [InlineKeyboardButton(text="🔥 Offers", callback_data="admin:offer_help"), InlineKeyboardButton(text="💬 Support", callback_data="admin:support_help")],
+    [InlineKeyboardButton(text="📈 Sales Dashboard", callback_data="admin:sales_dashboard")],
     [InlineKeyboardButton(text="📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast_help")],
     [InlineKeyboardButton(text="🔄 Refresh Order Status", callback_data="admin:status_help")],
 ])
@@ -147,6 +150,7 @@ async def init_db():
           telegram_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
           referrer_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS managed_products(product_id TEXT PRIMARY KEY, display_name TEXT, enabled INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS prices(
           product_id TEXT PRIMARY KEY, selling_price_usd TEXT NOT NULL
         );
@@ -232,6 +236,26 @@ async def display_price(product: dict):
     # Supplier cost must never leak to customers.
     return await selling_price_for_product(product)
 
+async def catalog_products():
+    """Preserve original approved products, with admin-added supplier IDs and visibility overrides."""
+    raw = extract_products(await vente.products(lang="en"))
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute("SELECT product_id,display_name,enabled FROM managed_products")).fetchall()
+    overrides = {str(pid): (name, enabled) for pid, name, enabled in rows}
+    selected = []
+    for product in raw:
+        pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
+        original = str(product.get("name") or product.get("title") or "")
+        record = overrides.get(pid)
+        if record and not record[1]:
+            continue
+        if canonical_storebat_name(original) or (record and record[1]):
+            item = dict(product)
+            item["name"] = (record[0] if record and record[0] else canonical_storebat_name(original) or original)
+            selected.append(item)
+    return selected
+
+
 async def get_product(product_id: str):
     data = await vente.products(lang="en")
     for p in extract_products(data):
@@ -277,19 +301,27 @@ async def menu_my_account(m: Message):
 
 @dp.message(F.text == "🔎 Track Order")
 async def menu_track_order(m: Message):
-    await m.answer("🔎 To track an order, send /track ORDER_ID (example: /track 123).")
+    async with aiosqlite.connect(DB) as db:
+        rows=await (await db.execute("SELECT id,product_name,status FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 5",(m.from_user.id,))).fetchall()
+    if not rows: return await m.answer("You have no orders yet.")
+    buttons=[[InlineKeyboardButton(text=f"#{oid} • {str(name or 'Product')[:27]} • {customer_status_label(status)}",callback_data=f"customer:track:{oid}")] for oid,name,status in rows]
+    await m.answer("🔎 Select an order, or send /track ORDER_ID:",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("customer:track:"))
+async def customer_track_button(c: CallbackQuery):
+    oid=int(c.data.rsplit(":",1)[1])
+    await show_customer_order(c.message if False else _CustomerMessage(c),oid)
+    await c.answer()
+
+class _CustomerMessage:
+    def __init__(self,c): self.from_user=c.from_user; self.answer=c.message.answer
+
 
 @dp.message(Command("track"))
 async def menu_track_command(m: Message):
-    parts = (m.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await m.answer("Usage: /track ORDER_ID")
-    async with aiosqlite.connect(DB) as db:
-        row = await (await db.execute(
-            "SELECT product_name,status,created_at FROM orders WHERE id=? AND telegram_id=?",
-            (int(parts[1]),m.from_user.id))).fetchone()
-    if not row: return await m.answer("Order not found in your account.")
-    await m.answer(f"🔎 Order #{parts[1]}\\n📦 {row[0]}\\n📌 Status: {row[1]}\\n🕒 {row[2]}")
+    parts=(m.text or "").split()
+    if len(parts)!=2 or not parts[1].isdigit(): return await m.answer("Use /track ORDER_ID")
+    await show_customer_order(m,int(parts[1]))
 
 @dp.message(F.text == "⭐ Reviews")
 async def menu_reviews(m: Message):
@@ -327,7 +359,7 @@ def company_logo_id(product_name: str):
     return None
 
 async def product_list_markup():
-    items = sort_storebat_products(extract_products(await vente.products(lang="en")))
+    items = await catalog_products()
     rows = []
     for p in items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
@@ -458,6 +490,10 @@ async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
         cur = await db.execute("INSERT INTO orders(telegram_id,product_id,product_name,quantity,amount_usd,idempotency_key) VALUES(?,?,?,?,?,?)",
                                (c.from_user.id, pid, name, qty, f"{total:.2f}", idem))
         oid = cur.lastrowid; await db.commit()
+    for admin_id in ADMIN_IDS:
+        try:
+            await c.message.bot.send_message(admin_id, f"🆕 New order #{oid}\n📦 {name}\n🔢 Qty: {qty}\n💵 ${total:.2f}\n👤 Customer: {c.from_user.id}\n⏳ Awaiting payment")
+        except Exception: pass
     await c.message.answer(
         f"🛒 <b>New Order</b>\\n🧾 Order: #{oid}\\n📦 Product: {name}\\n🔢 Quantity: {qty}\\n💰 Total: ${total:.2f}\\n\\n"
         "💳 Select your payment method:",
@@ -579,7 +615,7 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
     try:
-        items = sort_storebat_products(extract_products(await vente.products(lang="en")))
+        items = await catalog_products()
     except VenteBotError as e:
         await c.message.answer(f"⚠️ Could not load products: {e}")
         return await c.answer()
@@ -615,6 +651,7 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:prices_page:{page+1}"))
     rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔎 Search Product", callback_data="admin:prices_search")])
 
     text = (
         "💵 <b>Product Prices</b>\n\n"
@@ -628,6 +665,109 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
         await c.message.answer(text, parse_mode="HTML", reply_markup=markup)
     await c.answer()
 
+@dp.callback_query(F.data == "admin:product_add")
+async def admin_product_add(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    await set_admin_product_state(c.from_user.id, "admin_add_search")
+    await c.message.answer("➕ Send a supplier product name to search VenteBot catalog. You can only add products that exist at the supplier.")
+    await c.answer()
+
+
+@dp.callback_query(F.data == "admin:product_edit")
+async def admin_product_edit(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    await set_admin_product_state(c.from_user.id, "admin_edit_search")
+    await c.message.answer("✏️ Send a product name to find it for editing.")
+    await c.answer()
+
+
+async def set_admin_product_state(uid, action):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO user_input_state(telegram_id,action) VALUES(?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,product_id=NULL,"
+            "order_id=NULL,created_at=CURRENT_TIMESTAMP", (uid, action))
+        await db.commit()
+
+
+async def admin_manage_search(m, term, mode):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    if len(term) < 2:
+        return await m.answer("Enter at least 2 characters.")
+    try:
+        products = extract_products(await vente.products(lang="en")) if mode == "add" else await catalog_products()
+    except VenteBotError:
+        return await m.answer("⚠️ Supplier catalog unavailable.")
+    rows = []
+    for product in products:
+        pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
+        name = str(product.get("name") or product.get("title") or "")
+        if pid and term.casefold() in name.casefold():
+            rows.append([InlineKeyboardButton(text=name[:55], callback_data=f"admin:manage:{mode}:{pid}")])
+            if len(rows) >= 15:
+                break
+    if not rows:
+        return await m.answer("No matching supplier products. Try another name.")
+    await m.answer("Select a product:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("admin:manage:"))
+async def admin_manage_select(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    _, _, mode, pid = c.data.split(":", 3)
+    try:
+        p = await get_product(pid)
+    except VenteBotError:
+        return await c.answer("Supplier API unavailable", show_alert=True)
+    if not p:
+        return await c.answer("Supplier product not found", show_alert=True)
+    name = str(p.get("name") or p.get("title") or "Product")
+    if mode == "add":
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("INSERT INTO managed_products(product_id,display_name,enabled) VALUES(?,?,1) "
+                             "ON CONFLICT(product_id) DO UPDATE SET enabled=1", (pid, name))
+            await db.commit()
+        await c.message.answer(f"✅ Product added to your catalog: {name}\\nSet its selling price under Product Prices before selling.")
+    elif mode == "edit":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💵 Edit Price", callback_data=f"admin:price_item:{pid}")],
+            [InlineKeyboardButton(text="✏️ Rename Product", callback_data=f"admin:rename:{pid}")],
+            [InlineKeyboardButton(text="🙈 Hide Product", callback_data=f"admin:hide:{pid}")]])
+        await c.message.answer(f"✏️ Edit: {name}", reply_markup=keyboard)
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:rename:"))
+async def admin_rename_start(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    pid = c.data.rsplit(":", 1)[-1]
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,product_id) VALUES(?,?,?) "
+                         "ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,product_id=excluded.product_id",
+                         (c.from_user.id, "admin_rename_product", pid))
+        await db.commit()
+    await c.message.answer("Send the new display name (max 100 characters).")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:hide:"))
+async def admin_hide_product(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    pid = c.data.rsplit(":", 1)[-1]
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO managed_products(product_id,enabled) VALUES(?,0) "
+                         "ON CONFLICT(product_id) DO UPDATE SET enabled=0", (pid,))
+        await db.commit()
+    await c.message.answer("🙈 Product hidden from customer catalog. You can restore it with Add Product.")
+    await c.answer()
+
+
 @dp.callback_query(F.data == "admin:prices")
 async def admin_prices(c: CallbackQuery):
     await show_admin_prices(c, 0)
@@ -639,6 +779,51 @@ async def admin_prices_page(c: CallbackQuery):
     except ValueError:
         page = 0
     await show_admin_prices(c, page)
+
+@dp.callback_query(F.data == "admin:prices_search")
+async def admin_prices_search_start(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO user_input_state(telegram_id,action) VALUES(?, 'admin_price_search') "
+            "ON CONFLICT(telegram_id) DO UPDATE SET action='admin_price_search',"
+            "order_id=NULL,product_id=NULL,created_at=CURRENT_TIMESTAMP",
+            (c.from_user.id,))
+        await db.commit()
+    await c.message.answer("🔎 Send a product name to find it for price setup. Send /cancelsearch to exit.")
+    await c.answer()
+
+
+async def admin_price_search_results(m: Message, term: str):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    if len(term) < 2:
+        return await m.answer("Please enter at least 2 characters.")
+    try:
+        items = await catalog_products()
+    except VenteBotError:
+        return await m.answer("⚠️ Catalog is temporarily unavailable. Try again later.")
+    matches = []
+    for p in items:
+        name = canonical_storebat_name(str(p.get("name") or p.get("title") or "")) or str(p.get("name") or p.get("title") or "")
+        if term.casefold() in name.casefold():
+            pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
+            if pid:
+                matches.append((p, pid, name))
+    if not matches:
+        return await m.answer("🔎 No matching products. Try another keyword.")
+    rows = []
+    for p, pid, name in matches[:15]:
+        price = await selling_price_for_product(p)
+        price_label = f"${price:.2f}" if isinstance(price, Decimal) else "Not set"
+        rows.append([InlineKeyboardButton(
+            text=f"📦 {name[:38]} | {price_label}"[:64],
+            callback_data=f"admin:price_item:{pid}")])
+    rows.append([InlineKeyboardButton(text="🔙 Product Prices", callback_data="admin:prices")])
+    await m.answer(f"🔎 Price setup search: {term} ({len(matches)} found; showing up to 15)",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
 
 @dp.callback_query(F.data == "admin:prices_noop")
 async def admin_prices_noop(c: CallbackQuery):
@@ -786,7 +971,11 @@ async def send_delivery_if_ready(bot: Bot, oid: int, uid: int, supplier_id: str)
         status=(result.get("status") or data.get("status") or "processing") if isinstance(result,dict) else "processing"
         delivery=(result.get("delivery") or result.get("credentials") or result.get("account") or data.get("delivery") or data.get("credentials") or data.get("account")) if isinstance(result,dict) else None
         async with aiosqlite.connect(DB) as db:
+            previous=(await (await db.execute("SELECT status FROM orders WHERE id=?",(oid,))).fetchone())
             await db.execute("UPDATE orders SET status=? WHERE id=?",(str(status),oid)); await db.commit()
+        if previous and str(previous[0]).lower()!=str(status).lower():
+            try: await bot.send_message(uid,f"📦 Order #{oid} updated: {customer_status_label(status)}")
+            except Exception: pass
         if delivery:
             await bot.send_message(uid, f"🎉 <b>Order #{oid} Delivered</b>\n\n{delivery}", parse_mode="HTML")
             return True
@@ -835,6 +1024,9 @@ async def refresh_status(m: Message):
     delivery=(result.get("delivery") or result.get("credentials") or data.get("delivery") or data.get("credentials")) if isinstance(result,dict) else None
     async with aiosqlite.connect(DB) as db:
         await db.execute("UPDATE orders SET status=? WHERE id=?",(str(status),oid)); await db.commit()
+    if str(status).lower()!=str(row[2]).lower():
+        try: await m.bot.send_message(row[0],f"📦 Order #{oid} updated: {customer_status_label(status)}")
+        except Exception: pass
     text=f"📦 Order #{oid}\\nStatus: {status}"
     if delivery: text += f"\\n\\n🎁 Delivery:\\n{delivery}"
     await m.answer(text)
@@ -1140,6 +1332,92 @@ async def admin_stats(c: CallbackQuery):
         refs=(await (await db.execute("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")).fetchone())[0]
     await c.message.answer(f"📊 Store Statistics\n👥 Users: {users}\n📦 Orders: {orders}\n⏳ Pending approvals: {pending}\n🎁 Referred users: {refs}\n💵 Processed order value: ${sales:.2f}"); await c.answer()
 
+# Additional customer tools. Existing payment/order handlers remain in place.
+def customer_status_label(status):
+    status = str(status or "unknown").lower()
+    if status in ("awaiting_payment", "payment_submitted", "pending", "payment_pending"):
+        return "🟡 Pending" + (" — payment verification" if status == "payment_submitted" else "")
+    if status in ("processing", "submitted", "approved", "in_progress", "in progress"):
+        return "🔵 Processing"
+    if status in ("delivered", "completed", "complete", "success", "fulfilled"):
+        return "🟢 Delivered"
+    if status in ("cancelled", "canceled", "failed", "payment_rejected", "rejected"):
+        return "🔴 Cancelled / Rejected"
+    return "📌 " + status.replace("_", " ").title()
+
+async def show_customer_order(m, oid):
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT id,product_name,quantity,amount_usd,status,payment_method,created_at FROM orders WHERE id=? AND telegram_id=?",
+            (oid, m.from_user.id))).fetchone()
+    if not row:
+        return await m.answer("⚠️ Order not found in your account.")
+    number,name,qty,amount,status,method,created = row
+    await m.answer(f"📦 Order #{number}\n🛍️ {name or 'Product'}\n🔢 Quantity: {qty}\n"
+                   f"💵 Total: ${amount or '—'}\n💳 Method: {method or '—'}\n"
+                   f"📍 {customer_status_label(status)}\n🕒 Created: {created}\n\n"
+                   f"🔄 To refresh supplier status, send /status {number}.")
+
+@dp.message(F.text == "🔎 Search Products")
+async def customer_search_start(m: Message):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO user_input_state(telegram_id,action) VALUES(?, 'product_search') "
+                         "ON CONFLICT(telegram_id) DO UPDATE SET action='product_search',order_id=NULL,product_id=NULL",
+                         (m.from_user.id,))
+        await db.commit()
+    await m.answer("🔎 Type a product name to search. Send /cancelsearch to exit.")
+
+@dp.message(Command("cancelsearch"))
+async def customer_search_cancel(m: Message):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action='product_search'",(m.from_user.id,))
+        await db.commit()
+    await m.answer("Search closed.")
+
+@dp.message(Command("search"))
+async def customer_search_command(m: Message):
+    term=(m.text or "").partition(" ")[2].strip()
+    if not term: return await m.answer("Use /search PRODUCT_NAME")
+    await customer_search_results(m,term)
+
+async def customer_search_results(m, term):
+    if len(term) < 2: return await m.answer("Enter at least 2 characters.")
+    try: items=await catalog_products()
+    except VenteBotError: return await m.answer("⚠️ Catalog is temporarily unavailable. Try again later.")
+    matches=[]
+    for product in items:
+        name=canonical_storebat_name(str(product.get("name") or product.get("title") or ""))
+        if name and term.casefold() in name.casefold(): matches.append((product,name))
+    if not matches: return await m.answer("🔎 No matching products found. Try another keyword.")
+    buttons=[]
+    for product,name in matches[:15]:
+        pid=str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
+        if not pid: continue
+        price=await display_price(product)
+        label=f"📦 {name[:34]} — ${price:.2f}" if isinstance(price,Decimal) else f"📦 {name[:40]}"
+        buttons.append([InlineKeyboardButton(text=label[:64],callback_data=f"product:{pid}")])
+    if not buttons: return await m.answer("No available matching products.")
+    await m.answer(f"🔎 Results for: {term} ({len(matches)} found; showing up to 15)",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data == "admin:sales_dashboard")
+async def admin_sales_dashboard(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        today=(await (await db.execute("SELECT COUNT(*) FROM orders WHERE date(created_at)=date('now')")).fetchone())[0]
+        total=(await (await db.execute("SELECT COUNT(*) FROM orders")).fetchone())[0]
+        pending=(await (await db.execute("SELECT COUNT(*) FROM orders WHERE lower(status) IN ('awaiting_payment','payment_submitted','pending')")).fetchone())[0]
+        # Only supplier-submitted/fulfilled orders count as processed order value; not profit.
+        sales=(await (await db.execute("SELECT COALESCE(SUM(CAST(amount_usd AS REAL)),0) FROM orders WHERE lower(status) IN ('submitted','processing','delivered','completed','complete','success','fulfilled')")).fetchone())[0]
+        leaders=await (await db.execute("SELECT COALESCE(product_name,'Product'),COUNT(*) AS n FROM orders "
+                         "WHERE lower(status) IN ('submitted','processing','delivered','completed','complete','success','fulfilled') "
+                         "GROUP BY product_id ORDER BY n DESC LIMIT 5")).fetchall()
+    ranking="\n".join(f"{i}. {name[:40]} — {n}" for i,(name,n) in enumerate(leaders,1)) or "No processed orders yet"
+    await c.message.answer(f"📈 Sales Dashboard (UTC)\n\n📦 Today's orders: {today}\n"
+                           f"🧾 All orders: {total}\n🟡 Pending: {pending}\n"
+                           f"💵 Processed order value: ${sales:.2f}\n\n🏆 Top products (processed orders):\n{ranking}")
+    await c.answer()
+
 @dp.message(F.text)
 async def pending_text_input(m: Message):
     # Handles only text explicitly requested by a previous button (custom quantity / payment reference).
@@ -1148,6 +1426,24 @@ async def pending_text_input(m: Message):
     if not state: return
     action, oid, pid = state
     text=(m.text or "").strip()
+    if action == "admin_add_search":
+        return await admin_manage_search(m, text, "add")
+    if action == "admin_edit_search":
+        return await admin_manage_search(m, text, "edit")
+    if action == "admin_rename_product":
+        if m.from_user.id not in ADMIN_IDS: return
+        if not 1 <= len(text) <= 100: return await m.answer("Name must be 1–100 characters.")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("INSERT INTO managed_products(product_id,display_name,enabled) VALUES(?,?,1) "
+                             "ON CONFLICT(product_id) DO UPDATE SET display_name=excluded.display_name",
+                             (pid, text))
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?", (m.from_user.id,))
+            await db.commit()
+        return await m.answer("✅ Product display name updated.")
+    if action == "product_search":
+        return await customer_search_results(m,text)
+    if action == "admin_price_search":
+        return await admin_price_search_results(m,text)
     if action == "admin_set_price":
         if m.from_user.id not in ADMIN_IDS:
             return
