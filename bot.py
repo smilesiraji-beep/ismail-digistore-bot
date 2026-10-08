@@ -432,7 +432,7 @@ async def change_payment_method(c: CallbackQuery):
     async with aiosqlite.connect(DB) as db:
         row=await (await db.execute("SELECT 1 FROM orders WHERE id=? AND telegram_id=? AND status='awaiting_payment'",(oid,c.from_user.id))).fetchone()
     if not row: return await c.answer("Order not awaiting payment.", show_alert=True)
-    await c.message.answer("💳 Select Payment Method:",reply_markup=payment_method_keyboard(oid))
+    await c.message.edit_text("💳 Select Payment Method:",reply_markup=payment_method_keyboard(oid))
     await c.answer()
 
 @dp.callback_query(F.data.startswith("qty:"))
@@ -931,50 +931,58 @@ async def my_orders(m: Message):
     await m.answer("\n".join(text))
 
 def payment_category_keyboard():
+    # Telegram inline buttons cannot contain image logos; branded emoji labels are used.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌍 International Payment", callback_data="payment_category:international")],
-        [InlineKeyboardButton(text="🇧🇩 Local Payment", callback_data="payment_category:local")],
+        [InlineKeyboardButton(text="🌍 International Payment · 🟡 Binance Pay", callback_data="payment_info:binance")],
+        [InlineKeyboardButton(text="🇧🇩 Local Payment · 💗 bKash", callback_data="payment_info:bkash")],
+        [InlineKeyboardButton(text="🇧🇩 Local Payment · 🟠 Nagad", callback_data="payment_info:nagad")],
     ])
 
 @dp.message(F.text == "💳 Payment")
 async def payment(m: Message):
-    await m.answer("💳 Select Payment Category:", reply_markup=payment_category_keyboard())
+    await m.answer("💳 Select Payment Method:\n\n🌍 International Payment — Binance Pay\n🇧🇩 Local Payment — bKash / Nagad", reply_markup=payment_category_keyboard())
 
 @dp.callback_query(F.data.startswith("payment_category:"))
 async def payment_category(c: CallbackQuery):
+    # Backward compatibility with buttons sent by older versions of the bot.
     category = c.data.split(":", 1)[1]
     if category == "international":
-        buttons = [[InlineKeyboardButton(text="🟡 Binance Pay", callback_data="payment_info:binance")]]
+        await c.message.edit_text("🌍 International Payment", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🟡 Binance Pay", callback_data="payment_info:binance")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="payment_info:back")]]))
     elif category == "local":
-        buttons = [[InlineKeyboardButton(text="💗 bKash", callback_data="payment_info:bkash"),
-                    InlineKeyboardButton(text="🟠 Nagad", callback_data="payment_info:nagad")]]
+        await c.message.edit_text("🇧🇩 Local Payment", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💗 bKash", callback_data="payment_info:bkash"), InlineKeyboardButton(text="🟠 Nagad", callback_data="payment_info:nagad")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="payment_info:back")]]))
     else:
         return await c.answer("Invalid payment category", show_alert=True)
-    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="payment_info:back")])
-    await c.message.answer("💳 Select Payment Method:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await c.answer()
 
 @dp.callback_query(F.data.startswith("payment_info:"))
 async def payment_info(c: CallbackQuery):
     method = c.data.split(":", 1)[1]
     if method == "back":
-        await c.message.answer("💳 Select Payment Category:", reply_markup=payment_category_keyboard())
+        text = "💳 Select Payment Method:\n\n🌍 International Payment — Binance Pay\n🇧🇩 Local Payment — bKash / Nagad"
+        buttons = payment_category_keyboard()
     elif method == "binance":
         instructions = await get_setting("payment_instructions", "Payment method has not been configured yet. Please contact support.")
-        await c.message.answer(f"🌍 International Payment — Binance Pay\n\n{instructions}")
+        text = f"🌍 International Payment — 🟡 Binance Pay\n\n{instructions}"
+        buttons = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="payment_info:back")]])
     elif method in ("bkash", "nagad"):
-        name, number = ("bKash", BKASH_NUMBER) if method == "bkash" else ("Nagad", NAGAD_NUMBER)
-        await c.message.answer(
-            f"🇧🇩 Local Payment — {name}\n"
-            f"📱 Personal Send Money: {number}\n"
-            "💱 Conversion: 1 USD = ৳131\n\n"
-            "To see the exact amount, select a product and place an order. "
-            "Choose this payment method at checkout, send the amount shown, "
-            "and submit the Transaction ID for admin verification."
-        )
+        name, number, logo = ("bKash", BKASH_NUMBER, "💗") if method == "bkash" else ("Nagad", NAGAD_NUMBER, "🟠")
+        text = (f"🇧🇩 Local Payment — {logo} {name}\n"
+                f"📱 Personal Send Money: {number}\n"
+                "💱 Conversion: 1 USD = ৳131\n\n"
+                "To see the exact amount, select a product and place an order. "
+                "Choose this payment method at checkout, send the amount shown, "
+                "and submit the Transaction ID for admin verification.")
+        buttons = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="payment_info:back")]])
     else:
         return await c.answer("Invalid payment method", show_alert=True)
+    # Edit the original menu message instead of adding a new one on every click.
+    await c.message.edit_text(text, reply_markup=buttons)
     await c.answer()
+
 @dp.message(Command("setsupport"))
 async def setsupport(m: Message):
     if m.from_user.id not in ADMIN_IDS: return
