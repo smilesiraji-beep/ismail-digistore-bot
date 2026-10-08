@@ -595,47 +595,68 @@ async def admin_price_item(c: CallbackQuery):
     await c.answer()
 
 
+def order_group(status):
+    value = (status or "").lower().strip()
+    if value in ("cancelled", "canceled", "failed", "payment_rejected", "rejected", "refunded"):
+        return "cancelled"
+    if value in ("delivered", "completed", "complete", "success", "fulfilled", "finished"):
+        return "delivered"
+    if value in ("awaiting_payment", "payment_submitted", "pending", "unpaid", "waiting", "pending_payment"):
+        return "pending"
+    return "processing"
+
 @dp.callback_query(F.data.startswith("admin:all_orders:"))
 async def admin_all_orders(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
+    parts = c.data.split(":")
+    group = parts[2] if len(parts) == 4 else "all"
+    if group not in ("all", "pending", "processing", "delivered", "cancelled"):
+        return await c.answer("Invalid category", show_alert=True)
     try:
-        page = max(0, int(c.data.rsplit(":", 1)[1]))
+        page = max(0, int(parts[-1]))
     except ValueError:
-        return await c.answer("Invalid page.", show_alert=True)
-    per_page = 5
+        return await c.answer("Invalid page", show_alert=True)
     async with aiosqlite.connect(DB) as db:
-        total = (await (await db.execute("SELECT COUNT(*) FROM orders")).fetchone())[0]
-        pages = max(1, (total + per_page - 1) // per_page)
-        page = min(page, pages - 1)
-        rows = await (await db.execute(
+        all_rows = await (await db.execute(
             "SELECT id,telegram_id,product_name,quantity,amount_usd,status,payment_method,payment_reference,created_at "
-            "FROM orders ORDER BY id DESC LIMIT ? OFFSET ?",
-            (per_page, page * per_page))).fetchall()
-    lines = [f"📦 All Orders — Page {page + 1}/{pages}", f"📊 Total Orders: {total}"]
+            "FROM orders ORDER BY id DESC")).fetchall()
+    counts = {key: sum(order_group(r[5]) == key for r in all_rows) for key in ("pending", "processing", "delivered", "cancelled")}
+    selected = [r for r in all_rows if group == "all" or order_group(r[5]) == group]
+    per_page = 5
+    pages = max(1, (len(selected) + per_page - 1) // per_page)
+    page = min(page, pages - 1)
+    rows = selected[page*per_page:(page+1)*per_page]
+    label = {"all":"📦 All Orders", "pending":"🟡 Pending", "processing":"🔵 Processing", "delivered":"🟢 Delivered", "cancelled":"🔴 Cancelled"}[group]
+    lines = [label, f"📊 Total: {len(selected)} | Page {page+1}/{pages}"]
     for oid, uid, product, qty, usd, status, method, ref, created in rows:
-        lines.extend([
-            "",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"🧾 Order #{oid}",
-            f"📦 Product: {product or 'Product'}",
-            f"🔢 Quantity: {qty or 1}",
-            f"💵 Amount: ${usd if usd is not None else '0'}",
-            f"💳 Payment: {(method or 'binance').title()}",
-            f"📌 Status: {(status or 'unknown').replace('_', ' ').title()}",
-            f"👤 Customer ID: {uid}",
-            f"🔎 Transaction ID: {ref or '—'}",
-            f"🕒 Date: {created or '—'}",
-        ])
-    if not rows:
-        lines.append("No orders yet.")
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:all_orders:{page-1}"))
-    if page + 1 < pages:
-        nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:all_orders:{page+1}"))
-    keys = ([nav] if nav else []) + [[InlineKeyboardButton(text="🔙 Admin Menu", callback_data="admin:all_orders_back")]]
-    await c.message.edit_text("\\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keys))
+        raw_status = (status or "unknown").replace("_", " ").title()
+        pay_status = ("Pending verification" if status == "payment_submitted" else
+                      "Unpaid" if status == "awaiting_payment" else
+                      "Rejected" if status == "payment_rejected" else
+                      "Cancelled" if status == "cancelled" else
+                      "Approved / supplier processing" if order_group(status) == "processing" else
+                      "Approved / delivered" if order_group(status) == "delivered" else "Check order")
+        lines.extend(["", "━━━━━━━━━━━━━━━━━━", f"🧾 Order ID: #{oid}",
+                      f"📦 Product: {product or '—'}", f"🔢 Quantity: {qty or 1}",
+                      f"👤 Customer ID: {uid}", f"💵 Amount: ${usd if usd is not None else '0'}",
+                      f"💳 Method: {(method or 'binance').title()}",
+                      f"💰 Payment Status: {pay_status}", f"📌 Order Status: {raw_status}",
+                      f"📅 Order Date: {created or '—'}"])
+    if not rows: lines.append("\nNo orders in this category.")
+    keyboard = [
+        [InlineKeyboardButton(text="📦 All", callback_data="admin:all_orders:all:0")],
+        [InlineKeyboardButton(text=f"🟡 Pending ({counts['pending']})", callback_data="admin:all_orders:pending:0"),
+         InlineKeyboardButton(text=f"🔵 Processing ({counts['processing']})", callback_data="admin:all_orders:processing:0")],
+        [InlineKeyboardButton(text=f"🟢 Delivered ({counts['delivered']})", callback_data="admin:all_orders:delivered:0"),
+         InlineKeyboardButton(text=f"🔴 Cancelled ({counts['cancelled']})", callback_data="admin:all_orders:cancelled:0")]
+    ]
+    nav=[]
+    if page > 0: nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:all_orders:{group}:{page-1}"))
+    if page+1 < pages: nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:all_orders:{group}:{page+1}"))
+    if nav: keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton(text="🔙 Admin Menu", callback_data="admin:all_orders_back")])
+    await c.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await c.answer()
 
 @dp.callback_query(F.data == "admin:all_orders_back")
