@@ -612,16 +612,23 @@ async def admin_all_orders(c: CallbackQuery):
             "SELECT id,telegram_id,product_name,quantity,amount_usd,status,payment_method,payment_reference,created_at "
             "FROM orders ORDER BY id DESC LIMIT ? OFFSET ?",
             (per_page, page * per_page))).fetchall()
-    lines = [f"📦 All Orders — Page {page + 1}/{pages} (Total: {total})"]
+    lines = [f"📦 All Orders — Page {page + 1}/{pages}", f"📊 Total Orders: {total}"]
     for oid, uid, product, qty, usd, status, method, ref, created in rows:
-        lines.append(
-            f"\\n🧾 #{oid} | {status or 'unknown'}"
-            f"\\n📦 {product or 'Product'} × {qty or 1}"
-            f"\\n👤 {uid} | 💵 ${usd or '0'}"
-            f"\\n💳 {method or 'binance'} | Ref: {ref or '—'}"
-            f"\\n🕒 {created or '—'}")
+        lines.extend([
+            "",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🧾 Order #{oid}",
+            f"📦 Product: {product or 'Product'}",
+            f"🔢 Quantity: {qty or 1}",
+            f"💵 Amount: ${usd if usd is not None else '0'}",
+            f"💳 Payment: {(method or 'binance').title()}",
+            f"📌 Status: {(status or 'unknown').replace('_', ' ').title()}",
+            f"👤 Customer ID: {uid}",
+            f"🔎 Transaction ID: {ref or '—'}",
+            f"🕒 Date: {created or '—'}",
+        ])
     if not rows:
-        lines.append("\\nNo orders yet.")
+        lines.append("No orders yet.")
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:all_orders:{page-1}"))
