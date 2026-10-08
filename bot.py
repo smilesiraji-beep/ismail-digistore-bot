@@ -1,6 +1,7 @@
 import asyncio
 import os
 import json
+import re
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -238,6 +239,37 @@ async def display_price(product: dict):
     # Supplier cost must never leak to customers.
     return await selling_price_for_product(product)
 
+def product_family(name: str) -> str:
+    """Group variants by the leading product/brand name, ignoring case and punctuation."""
+    words = re.findall(r"[a-z0-9]+", str(name).casefold())
+    return words[0] if words else ""
+
+
+def group_products_by_name(items, overrides):
+    """Keep pinned groups first, then group same-name variants in original order."""
+    groups = {}
+    first_seen = {}
+    for index, item in enumerate(items):
+        pid = str(item.get("id") or item.get("product_id") or item.get("uuid") or "")
+        family = product_family(item.get("name") or item.get("title") or "")
+        key = family or ("product:" + pid)
+        groups.setdefault(key, []).append(item)
+        first_seen.setdefault(key, index)
+
+    def pin_value(item):
+        pid = str(item.get("id") or item.get("product_id") or item.get("uuid") or "")
+        return overrides.get(pid, (None, 1, 0))[2] or 0
+
+    ordered = sorted(groups, key=lambda key: (
+        -max(pin_value(item) for item in groups[key]),
+        first_seen[key]
+    ))
+    result = []
+    for key in ordered:
+        result.extend(sorted(groups[key], key=lambda item: -pin_value(item)))
+    return result
+
+
 async def catalog_products():
     """Preserve original approved products, with admin-added supplier IDs and visibility overrides."""
     raw = extract_products(await vente.products(lang="en"))
@@ -255,9 +287,9 @@ async def catalog_products():
             item = dict(product)
             item["name"] = (record[0] if record and record[0] else canonical_storebat_name(original) or original)
             selected.append(item)
-    # Pinned products appear first; newest pin is first. All others keep supplier order.
-    selected.sort(key=lambda item: -(overrides.get(str(item.get("id") or item.get("product_id") or item.get("uuid") or ""), (None, 1, 0))[2] or 0))
-    return selected
+    # Same-name variants stay together in both customer and admin listings.
+    # A pinned product brings its whole family to the top.
+    return group_products_by_name(selected, overrides)
 
 
 async def get_product(product_id: str):
