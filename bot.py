@@ -724,8 +724,9 @@ async def show_admin_edit_products(c: CallbackQuery, page: int = 0):
         nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:edit_page:{page+1}"))
     rows.append(nav)
     rows.append([InlineKeyboardButton(text="🔎 Search instead", callback_data="admin:edit_search")])
-    await c.message.answer(f"✏️ Edit Products ({len(items)} total)\nTap a product to change its name or price.",
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    text = f"✏️ Edit Products ({len(items)} total) — Page {page+1}/{pages}\nTap a product to change its name or price."
+    # Replace the current Telegram message instead of sending a new message on Next/Previous.
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await c.answer()
 
 
