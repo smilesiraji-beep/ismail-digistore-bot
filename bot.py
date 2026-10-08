@@ -131,8 +131,7 @@ def sort_storebat_products(items):
 
 
 ADMIN_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="➕ Add Product", callback_data="admin:product_add"), InlineKeyboardButton(text="✏️ Edit Product", callback_data="admin:product_edit")],
-    [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
+    [InlineKeyboardButton(text="📦 Product Management", callback_data="admin:products_manage")],
     [InlineKeyboardButton(text="📦 All Orders", callback_data="admin:all_orders:0")],
     [InlineKeyboardButton(text="📦 Pending Payments", callback_data="admin:pending")],
     [InlineKeyboardButton(text="🎁 Referral Campaigns", callback_data="admin:ref_help")],
@@ -665,6 +664,21 @@ async def show_admin_prices(c: CallbackQuery, page: int = 0):
         await c.message.answer(text, parse_mode="HTML", reply_markup=markup)
     await c.answer()
 
+@dp.callback_query(F.data == "admin:products_manage")
+async def admin_products_manage(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 All Products / Edit", callback_data="admin:product_edit")],
+        [InlineKeyboardButton(text="➕ Add New Product", callback_data="admin:product_add")],
+        [InlineKeyboardButton(text="🔎 Search Product", callback_data="admin:edit_search")],
+        [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
+        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin:home")],
+    ])
+    await c.message.answer("📦 <b>Product Management</b>\nChoose an option below.\nTo edit a product's price, open All Products / Edit and select the product.", parse_mode="HTML", reply_markup=kb)
+    await c.answer()
+
+
 @dp.callback_query(F.data == "admin:product_add")
 async def admin_product_add(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
@@ -777,7 +791,7 @@ async def admin_manage_select(c: CallbackQuery):
             await db.execute("INSERT INTO managed_products(product_id,display_name,enabled) VALUES(?,?,1) "
                              "ON CONFLICT(product_id) DO UPDATE SET enabled=1", (pid, name))
             await db.commit()
-        await c.message.answer(f"✅ Product added to your catalog: {name}\\nSet its selling price under Product Prices before selling.")
+        await c.message.answer(f"✅ Product added to your catalog: {name}\\nSet its selling price from Product Management before selling.")
     elif mode == "edit":
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💵 Edit Price", callback_data=f"admin:price_item:{pid}")],
