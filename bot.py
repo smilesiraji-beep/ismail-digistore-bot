@@ -400,11 +400,16 @@ def company_logo_id(product_name: str):
 async def product_list_markup():
     items = await catalog_products()
     rows = []
+    last_category = None
     for p in items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
         name = str(p.get("name") or p.get("title") or "Product")
+        category = api_category_header(name)
+        if category and category != last_category:
+            rows.append([InlineKeyboardButton(text=category, callback_data="products:category_noop")])
+        last_category = category
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
         logo_id = company_logo_id(name)
@@ -427,6 +432,10 @@ async def products(m: Message):
         await m.answer(f"⚠️ Product catalog is not available yet.\n{e}")
         return
     await m.answer("🛍️ <b>Ismail Digistore</b>\nChoose a product below:", parse_mode="HTML", reply_markup=markup)
+
+@dp.callback_query(F.data == "products:category_noop")
+async def products_category_noop(c: CallbackQuery):
+    await c.answer()
 
 @dp.callback_query(F.data == "products:refresh")
 async def products_refresh(c: CallbackQuery):
