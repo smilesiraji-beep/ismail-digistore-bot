@@ -546,17 +546,17 @@ async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
             await c.message.bot.send_message(admin_id, f"🆕 New order #{oid}\n📦 {name}\n🔢 Qty: {qty}\n💵 ${total:.2f}\n👤 Customer: {c.from_user.id}\n⏳ Awaiting payment")
         except Exception: pass
     await c.message.answer(
-        f"💎 <b>ISMAIL DIGISTORE</b>\\n"
-        f"━━━━━━━━━━━━━━━━━━\\n"
-        f"🛒 <b>ORDER SUMMARY</b>\\n"
-        f"━━━━━━━━━━━━━━━━━━\\n\\n"
-        f"🧾 <b>Order ID:</b> #{oid}\\n\\n"
-        f"📦 <b>Product:</b> {name}\\n"
-        f"🔢 <b>Quantity:</b> {qty}\\n\\n"
-        f"━━━━━━━━━━━━━━━━━━\\n"
-        f"💰 <b>TOTAL: ${total:.2f}</b>\\n"
-        f"━━━━━━━━━━━━━━━━━━\\n\\n"
-        f"💳 <b>SELECT PAYMENT METHOD</b>\\n"
+        f"💎 <b>ISMAIL DIGISTORE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛒 <b>ORDER SUMMARY</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"🧾 <b>Order ID:</b> #{oid}\n\n"
+        f"📦 <b>Product:</b> {name}\n"
+        f"🔢 <b>Quantity:</b> {qty}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>TOTAL: ${total:.2f}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"💳 <b>SELECT PAYMENT METHOD</b>\n"
         f"👇 Choose an option below:",
         parse_mode="HTML", reply_markup=payment_method_keyboard(oid))
 
