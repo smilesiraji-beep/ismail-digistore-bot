@@ -546,15 +546,25 @@ async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
             await c.message.bot.send_message(admin_id, f"🆕 New order #{oid}\n📦 {name}\n🔢 Qty: {qty}\n💵 ${total:.2f}\n👤 Customer: {c.from_user.id}\n⏳ Awaiting payment")
         except Exception: pass
     await c.message.answer(
-        f"🛒 <b>New Order</b>\\n🧾 Order: #{oid}\\n📦 Product: {name}\\n🔢 Quantity: {qty}\\n💰 Total: ${total:.2f}\\n\\n"
-        "💳 Select your payment method:",
+        f"💎 <b>ISMAIL DIGISTORE</b>\\n"
+        f"━━━━━━━━━━━━━━━━━━\\n"
+        f"🛒 <b>ORDER SUMMARY</b>\\n"
+        f"━━━━━━━━━━━━━━━━━━\\n\\n"
+        f"🧾 <b>Order ID:</b> #{oid}\\n\\n"
+        f"📦 <b>Product:</b> {name}\\n"
+        f"🔢 <b>Quantity:</b> {qty}\\n\\n"
+        f"━━━━━━━━━━━━━━━━━━\\n"
+        f"💰 <b>TOTAL: ${total:.2f}</b>\\n"
+        f"━━━━━━━━━━━━━━━━━━\\n\\n"
+        f"💳 <b>SELECT PAYMENT METHOD</b>\\n"
+        f"👇 Choose an option below:",
         parse_mode="HTML", reply_markup=payment_method_keyboard(oid))
 
 def payment_method_keyboard(oid):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌍 International Payment — Binance Pay", callback_data=f"method:{oid}:binance")],
-        [InlineKeyboardButton(text="🇧🇩 Local Payment — bKash", callback_data=f"method:{oid}:bkash"),
-         InlineKeyboardButton(text="🇧🇩 Local Payment — Nagad", callback_data=f"method:{oid}:nagad")],
+        [InlineKeyboardButton(text="💗 bKash · Local Payment", callback_data=f"method:{oid}:bkash"),
+         InlineKeyboardButton(text="🟠 Nagad · Local Payment", callback_data=f"method:{oid}:nagad")],
         [InlineKeyboardButton(text="❌ Cancel Order", callback_data=f"cancel:{oid}")]
     ])
 
