@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup, CopyTextButton
 from dotenv import load_dotenv
 
 from ventebot import VenteBotClient, VenteBotError, extract_products, money
@@ -604,9 +604,22 @@ async def select_payment_method(c: CallbackQuery):
                    f"📱 Personal number: <code>{number}</code>\n\n"
                    "Send Money to the number above, then submit your Transaction ID. "
                    "Payment must be verified by the admin before delivery.")
-    keys = InlineKeyboardMarkup(inline_keyboard=[
+    # Copy button only affects the payment keyboard; payment processing is unchanged.
+    if method == "binance":
+        # The Binance Pay ID is stored in the existing admin payment instructions.
+        id_match = re.search(r"(?im)\b(?:binance\s+pay\s+id|pay\s+id)\s*[:：#-]\s*([A-Za-z0-9_-]{4,64})", instructions)
+        copy_value = id_match.group(1) if id_match else None
+        copy_label = "📋 Copy Binance Pay ID"
+    else:
+        copy_value = number if number and number.strip() else None
+        copy_label = f"📋 Copy {name} Number"
+    payment_buttons = []
+    if copy_value:
+        payment_buttons.append([InlineKeyboardButton(text=copy_label, copy_text=CopyTextButton(text=copy_value))])
+    payment_buttons.extend([
         [InlineKeyboardButton(text="✅ I Paid — Submit Transaction ID", callback_data=f"payref:{oid}")],
         [InlineKeyboardButton(text="⬅️ Change Method", callback_data=f"methods:{oid}")]])
+    keys = InlineKeyboardMarkup(inline_keyboard=payment_buttons)
     await c.message.answer(f"🧾 Order #{oid}\n\n{details}", parse_mode="HTML", reply_markup=keys)
     await c.answer()
 
