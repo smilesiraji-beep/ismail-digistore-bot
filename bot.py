@@ -1223,6 +1223,7 @@ def supplier_order_id_from_response(result):
 
 
 def supplier_delivery_from_response(result):
+    """Extract actual fulfillment from VenteBot's nested order.items[].account_data."""
     if not isinstance(result, dict):
         return None
     objects = [result]
@@ -1230,11 +1231,23 @@ def supplier_delivery_from_response(result):
         if isinstance(parent, dict):
             objects.extend(parent.get(key) for key in ("data", "order", "result") if isinstance(parent.get(key), dict))
     for obj in objects:
-        if isinstance(obj, dict):
-            for key in ("delivery", "credentials", "account", "delivery_data", "delivery_info", "content", "accounts"):
-                value = obj.get(key)
-                if value:
-                    return value
+        if not isinstance(obj, dict):
+            continue
+        # Documented VenteBot order response: {"order": {"items": [{"account_data": "..."}]}}
+        items = obj.get("items")
+        if isinstance(items, list):
+            deliveries = []
+            for item in items:
+                if isinstance(item, dict):
+                    value = item.get("account_data")
+                    if isinstance(value, str) and value.strip():
+                        deliveries.append(value.strip())
+            if deliveries:
+                return "\n\n".join(deliveries)
+        for key in ("delivery", "credentials", "account", "delivery_data", "delivery_info", "content", "accounts"):
+            value = obj.get(key)
+            if value:
+                return value
     return None
 
 
