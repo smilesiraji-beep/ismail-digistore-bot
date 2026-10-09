@@ -1190,17 +1190,95 @@ async def admin_approve_button(c: CallbackQuery):
     except Exception: pass
     await c.answer()
 
+# Payment rejection reason choices; existing approval and supplier logic are untouched.
+PAYMENT_REJECT_REASONS = {
+    "unverified": "Payment screenshot or proof could not be verified.",
+    "not_found": "Transaction could not be found in the payment account.",
+    "amount": "The received payment amount does not match the order total.",
+    "duplicate": "The transaction reference has already been used.",
+    "details": "The submitted payment details are incomplete or incorrect.",
+}
+
 @dp.callback_query(F.data.startswith("admin:reject:"))
 async def admin_reject_button(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
     oid=int(c.data.rsplit(":",1)[1])
     async with aiosqlite.connect(DB) as db:
-        row=await (await db.execute("SELECT telegram_id FROM orders WHERE id=? AND status='payment_submitted'",(oid,))).fetchone()
-        if row: await db.execute("UPDATE orders SET status='payment_rejected' WHERE id=?",(oid,)); await db.commit()
-    if not row: await c.message.answer("Order is no longer pending."); return await c.answer()
-    await c.message.answer(f"❌ Payment for Order #{oid} rejected. No supplier order was created.")
-    try: await c.bot.send_message(row[0], f"❌ Payment for Order #{oid} could not be verified. Please contact support.")
-    except Exception: pass
+        row=await (await db.execute("SELECT id FROM orders WHERE id=? AND status='payment_submitted'",(oid,))).fetchone()
+    if not row: return await c.answer("Order is no longer pending.",show_alert=True)
+    keyboard=[
+        [InlineKeyboardButton(text="🧾 Proof not verified",callback_data=f"admin:reject_reason:{oid}:unverified")],
+        [InlineKeyboardButton(text="🔎 Transaction not found",callback_data=f"admin:reject_reason:{oid}:not_found")],
+        [InlineKeyboardButton(text="💰 Incorrect amount",callback_data=f"admin:reject_reason:{oid}:amount")],
+        [InlineKeyboardButton(text="🔁 Duplicate transaction",callback_data=f"admin:reject_reason:{oid}:duplicate")],
+        [InlineKeyboardButton(text="📝 Incorrect payment details",callback_data=f"admin:reject_reason:{oid}:details")],
+        [InlineKeyboardButton(text="✍️ Write custom reason",callback_data=f"admin:reject_custom:{oid}")],
+        [InlineKeyboardButton(text="⬅️ Keep payment pending",callback_data=f"admin:reject_cancel:{oid}")],
+    ]
+    await c.message.answer(f"❌ Choose a rejection reason for Order #{oid}.\nNo rejection will happen until you confirm.",reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:reject_reason:"))
+async def admin_reject_reason(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    _,_,oid_s,code=c.data.split(":",3)
+    oid=int(oid_s)
+    reason=PAYMENT_REJECT_REASONS.get(code)
+    if not reason: return await c.answer("Invalid reason",show_alert=True)
+    await show_reject_confirmation(c.message,c.from_user.id,oid,reason)
+    await c.answer()
+
+async def show_reject_confirmation(message,admin_id,oid,reason):
+    async with aiosqlite.connect(DB) as db:
+        row=await (await db.execute("SELECT id FROM orders WHERE id=? AND status='payment_submitted'",(oid,))).fetchone()
+        if not row: return await message.answer("Order is no longer pending.")
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,order_id,product_name) VALUES(?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=excluded.order_id,product_name=excluded.product_name,created_at=CURRENT_TIMESTAMP",(admin_id,"admin_reject_confirm",oid,reason))
+        await db.commit()
+    await message.answer(f"⚠️ Confirm payment rejection\n🧾 Order #{oid}\n📋 Reason: {reason}\n\nCustomer will receive this reason after confirmation.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Confirm Reject & Notify",callback_data=f"admin:reject_confirm:{oid}")],
+        [InlineKeyboardButton(text="⬅️ Cancel — Keep Pending",callback_data=f"admin:reject_cancel:{oid}")]
+    ]))
+
+@dp.callback_query(F.data.startswith("admin:reject_custom:"))
+async def admin_reject_custom(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    oid=int(c.data.rsplit(":",1)[1])
+    async with aiosqlite.connect(DB) as db:
+        row=await (await db.execute("SELECT id FROM orders WHERE id=? AND status='payment_submitted'",(oid,))).fetchone()
+        if not row: return await c.answer("Order is no longer pending.",show_alert=True)
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,order_id) VALUES(?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=excluded.order_id,product_name=NULL,created_at=CURRENT_TIMESTAMP",(c.from_user.id,"admin_reject_custom",oid))
+        await db.commit()
+    await c.message.answer(f"✍️ Reply with a rejection reason for Order #{oid} (5–300 characters).\nNo payment will be rejected until confirmation.")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:reject_cancel:"))
+async def admin_reject_cancel(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    oid=int(c.data.rsplit(":",1)[1])
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action IN ('admin_reject_custom','admin_reject_confirm') AND order_id=?",(c.from_user.id,oid))
+        await db.commit()
+    await c.message.answer(f"↩️ Rejection cancelled. Order #{oid} remains pending.")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:reject_confirm:"))
+async def admin_reject_confirm(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    oid=int(c.data.rsplit(":",1)[1])
+    async with aiosqlite.connect(DB) as db:
+        state=await (await db.execute("SELECT product_name FROM user_input_state WHERE telegram_id=? AND action='admin_reject_confirm' AND order_id=?",(c.from_user.id,oid))).fetchone()
+        if not state: return await c.answer("Reason expired. Please choose again.",show_alert=True)
+        reason=state[0]
+        cur=await db.execute("UPDATE orders SET status='payment_rejected' WHERE id=? AND status='payment_submitted'",(oid,))
+        row=await (await db.execute("SELECT telegram_id FROM orders WHERE id=?",(oid,))).fetchone() if cur.rowcount else None
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action='admin_reject_confirm' AND order_id=?",(c.from_user.id,oid))
+        await db.commit()
+    if not row: return await c.answer("Order is no longer pending.",show_alert=True)
+    await c.message.answer(f"❌ Order #{oid} rejected.\nReason: {reason}")
+    try:
+        await c.bot.send_message(row[0],f"❌ PAYMENT NOT VERIFIED\n\n🧾 Order ID: #{oid}\n📋 Reason: {reason}\n\nPlease check your payment details and contact support if you believe this is a mistake.")
+    except Exception:
+        await c.message.answer("⚠️ Customer notification could not be delivered (bot may be blocked).")
     await c.answer()
 
 @dp.message(Command("status"))
@@ -1649,6 +1727,13 @@ async def pending_text_input(m: Message):
     if not state: return
     action, oid, pid = state
     text=(m.text or "").strip()
+    if action == "admin_reject_custom":
+        if m.from_user.id not in ADMIN_IDS: return
+        if not 5 <= len(text) <= 300:
+            return await m.answer("Please enter a reason between 5 and 300 characters.")
+        return await show_reject_confirmation(m,m.from_user.id,oid,text)
+    if action == "admin_reject_confirm":
+        return await m.answer("Please use Confirm Reject or Cancel on the previous message.")
     if action == "admin_add_search":
         return await admin_manage_search(m, text, "add")
     if action == "admin_edit_search":
