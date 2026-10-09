@@ -591,18 +591,23 @@ async def select_payment_method(c: CallbackQuery):
         await db.commit()
     if method == "binance":
         instructions = await get_setting("payment_instructions", "Binance Pay details are not configured yet. Please contact support.")
-        details = f"🌍 <b>International Payment — Binance Pay</b>\\n💰 Amount: ${row[0]}\\n\\n{instructions}"
+        # Display escaped line breaks in saved instructions as actual new lines.
+        instructions = instructions.replace("\\n", "\n")
+        details = (f"🌍 <b>INTERNATIONAL PAYMENT</b>\n"
+                   f"💳 Binance Pay\n\n"
+                   f"💰 <b>Amount: ${row[0]}</b>\n\n"
+                   f"{instructions}")
     else:
         name, number = ("bKash", BKASH_NUMBER) if method == "bkash" else ("Nagad", NAGAD_NUMBER)
-        details = (f"🇧🇩 <b>Local Payment — {name}</b>\\n"
-                   f"💰 Send Money amount: ৳{local_total(row[0])}\\n"
-                   f"📱 Personal number: <code>{number}</code>\\n\\n"
+        details = (f"🇧🇩 <b>Local Payment — {name}</b>\n"
+                   f"💰 Send Money amount: ৳{local_total(row[0])}\n"
+                   f"📱 Personal number: <code>{number}</code>\n\n"
                    "Send Money to the number above, then submit your Transaction ID. "
                    "Payment must be verified by the admin before delivery.")
     keys = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ I Paid — Submit Transaction ID", callback_data=f"payref:{oid}")],
         [InlineKeyboardButton(text="⬅️ Change Method", callback_data=f"methods:{oid}")]])
-    await c.message.answer(f"🧾 Order #{oid}\\n\\n{details}", parse_mode="HTML", reply_markup=keys)
+    await c.message.answer(f"🧾 Order #{oid}\n\n{details}", parse_mode="HTML", reply_markup=keys)
     await c.answer()
 
 @dp.callback_query(F.data.startswith("methods:"))
