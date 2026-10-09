@@ -3,12 +3,14 @@ import os
 import json
 import re
 import uuid
+from io import BytesIO
+from html import escape
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup, CopyTextButton
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup, CopyTextButton, BufferedInputFile
 from dotenv import load_dotenv
 
 from ventebot import VenteBotClient, VenteBotError, extract_products, money
@@ -1166,9 +1168,7 @@ async def admin_check_supplier_status(c: CallbackQuery):
         if delivery:
             # Send before marking delivered; a failed Telegram send stays retryable.
             try:
-                from html import escape
-                payload = escape(delivery if isinstance(delivery, str) else json.dumps(delivery, ensure_ascii=False))
-                await c.bot.send_message(uid, f"🎉 <b>Order #{oid} Delivered</b>\n\n{payload}", parse_mode="HTML")
+                await send_premium_customer_delivery(c.bot, oid, uid, delivery)
             except Exception:
                 return await c.message.answer(
                     f"⚠️ Supplier returned delivery for Order #{oid}, but customer notification failed. "
@@ -1345,6 +1345,78 @@ async def submit_supplier_order(oid: int):
         raise VenteBotError("Supplier accepted request but did not return a recognizable order ID. DO NOT retry approval; reconcile with supplier order history.")
     return uid,supplier_id,status
 
+# Customer-facing delivery presentation only. Supplier fulfillment and pricing remain unchanged.
+async def send_premium_customer_delivery(bot: Bot, oid: int, uid: int, delivery):
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT product_name,quantity,amount_usd,created_at FROM orders WHERE id=? AND telegram_id=?",
+            (oid, uid))).fetchone()
+    if not row:
+        raise ValueError("Customer order missing; cannot send delivery")
+    name, qty, amount, created = row
+    payload = delivery if isinstance(delivery, str) else json.dumps(delivery, ensure_ascii=False)
+    message = (
+        f"📦 <b>Order #{oid}</b>\n"
+        f"📊 Status: ✅ <b>Completed</b>\n\n"
+        f"🛍️ Product: <b>{escape(str(name or 'Product'))}</b>\n"
+        f"🔢 Quantity: <b>{qty}</b>\n"
+        f"💰 Total: <b>${escape(str(amount or '—'))}</b>\n"
+        f"📅 Date: {escape(str(created or '—'))}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📩 <b>Here is your account:</b>\n"
+        f"🔑 {escape(payload)}\n\n"
+        "📌 Keep this information safe."
+    )
+    buttons = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Download as TXT", callback_data=f"customer:delivery_txt:{oid}")],
+        [InlineKeyboardButton(text="⬅️ Back to My Orders", callback_data="customer:delivery_orders")],
+    ])
+    await bot.send_message(uid, message, parse_mode="HTML", reply_markup=buttons,
+                           disable_web_page_preview=True)
+
+@dp.callback_query(F.data.startswith("customer:delivery_txt:"))
+async def customer_delivery_download(c: CallbackQuery):
+    try:
+        oid = int(c.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        return await c.answer("Invalid order", show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute(
+            "SELECT product_name,quantity,amount_usd,created_at,supplier_order_id,status "
+            "FROM orders WHERE id=? AND telegram_id=?", (oid, c.from_user.id))).fetchone()
+    if not row or order_group(row[5]) != "delivered" or not row[4]:
+        return await c.answer("Delivery not available for this order", show_alert=True)
+    try:
+        result = await vente.order(row[4])  # GET only; no new purchase
+        delivery = supplier_delivery_from_response(result)
+    except VenteBotError:
+        delivery = None
+    if not delivery:
+        return await c.answer("Delivery file temporarily unavailable. Please contact support.", show_alert=True)
+    payload = delivery if isinstance(delivery, str) else json.dumps(delivery, ensure_ascii=False)
+    content = (f"Ismail DigiStore — Order #{oid}\n"
+               f"Product: {row[0] or 'Product'}\nQuantity: {row[1]}\n"
+               f"Total: ${row[2] or '—'}\nDate: {row[3] or '—'}\n"
+               f"Status: Delivered\n\nHere is your account:\n{payload}\n\n"
+               "Keep this information safe.\n")
+    document = BufferedInputFile(content.encode("utf-8"), filename=f"Ismail_DigiStore_Order_{oid}.txt")
+    await c.bot.send_document(c.from_user.id, document, caption=f"📦 Order #{oid} — Your delivery file")
+    await c.answer()
+
+@dp.callback_query(F.data == "customer:delivery_orders")
+async def customer_delivery_orders(c: CallbackQuery):
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            "SELECT id,product_name,amount_usd,status,created_at FROM orders "
+            "WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (c.from_user.id,))).fetchall()
+    if not rows:
+        await c.message.answer("📦 You have no orders yet.")
+    else:
+        lines = ["📦 Your latest orders:"] + [
+            f"#{o} • {n or 'Product'} • ${a or '—'} • {st} • {d}" for o,n,a,st,d in rows]
+        await c.message.answer("\n".join(lines))
+    await c.answer()
+
 async def send_delivery_if_ready(bot: Bot, oid: int, uid: int, supplier_id: str):
     if not supplier_id: return False
     # Short polling window for instant-delivery products. Non-instant orders remain processing.
@@ -1362,9 +1434,7 @@ async def send_delivery_if_ready(bot: Bot, oid: int, uid: int, supplier_id: str)
             try: await bot.send_message(uid,f"📦 Order #{oid} updated: {customer_status_label(status)}")
             except Exception: pass
         if delivery:
-            from html import escape
-            payload = escape(delivery if isinstance(delivery, str) else json.dumps(delivery, ensure_ascii=False))
-            await bot.send_message(uid, f"🎉 <b>Order #{oid} Delivered</b>\n\n{payload}", parse_mode="HTML")
+            await send_premium_customer_delivery(bot, oid, uid, delivery)
             async with aiosqlite.connect(DB) as db:
                 await db.execute("UPDATE orders SET status='delivered' WHERE id=?", (oid,))
                 await db.commit()
@@ -2001,7 +2071,66 @@ async def pending_text_input(m: Message):
             try: await m.bot.send_message(admin_id,f"💳 <b>Payment submitted</b>\n🧾 Order #{oid}\n📦 {name}\n👤 {m.from_user.id}\n💵 ${amount}\n🔎 Ref: <code>{text}</code>\n🔑 ID: {act or 'Not supplied'}",parse_mode="HTML",reply_markup=keys)
             except Exception: pass
 
+# Automatic delivery: GET-only checks for already submitted supplier orders.
+# Keep a single bot process running; this in-memory lock coordinates with manual checks.
+AUTO_DELIVERY_INTERVAL_SECONDS = 90
+
+async def automatic_supplier_delivery_pass(bot: Bot):
+    async with aiosqlite.connect(DB) as db:
+        rows = await (await db.execute(
+            "SELECT id, telegram_id, supplier_order_id, status FROM orders "
+            "WHERE supplier_order_id IS NOT NULL AND supplier_order_id != '' "
+            "AND status NOT IN ('delivered','cancelled','payment_rejected','awaiting_payment','payment_submitted')"
+        )).fetchall()
+    for oid, uid, sid, _ in rows:
+        lock = _supplier_check_locks.setdefault(oid, asyncio.Lock())
+        async with lock:
+            async with aiosqlite.connect(DB) as db:
+                latest = await (await db.execute(
+                    "SELECT telegram_id, supplier_order_id, status FROM orders WHERE id=?", (oid,)
+                )).fetchone()
+            if not latest or latest[0] != uid or str(latest[1]) != str(sid):
+                continue
+            if order_group(latest[2]) in ('delivered', 'cancelled', 'pending'):
+                continue
+            try:
+                result = await vente.order(sid)  # GET only: never purchase again
+                delivery = supplier_delivery_from_response(result)
+                if not delivery:
+                    continue
+                await send_premium_customer_delivery(bot, oid, uid, delivery)
+                async with aiosqlite.connect(DB) as db:
+                    await db.execute(
+                        "UPDATE orders SET status='delivered' WHERE id=? AND supplier_order_id=? "
+                        "AND status NOT IN ('delivered','cancelled','payment_rejected')", (oid, sid)
+                    )
+                    await db.commit()
+            except Exception as exc:
+                # Never leak supplier credentials or delivery links in logs.
+                print(f"Automatic supplier delivery check failed for order #{oid}: {type(exc).__name__}")
+            await asyncio.sleep(1)  # Avoid bursts against the supplier rate limit.
+
+async def automatic_supplier_delivery_loop(bot: Bot):
+    while True:
+        await asyncio.sleep(AUTO_DELIVERY_INTERVAL_SECONDS)
+        try:
+            await automatic_supplier_delivery_pass(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Automatic supplier delivery pass failed: {type(exc).__name__}")
+
 async def main():
     if not TOKEN or "PASTE_" in TOKEN: raise RuntimeError("Set BOT_TOKEN in .env before starting the bot.")
-    await init_db(); bot = Bot(TOKEN); await dp.start_polling(bot)
+    await init_db()
+    bot = Bot(TOKEN)
+    delivery_task = asyncio.create_task(automatic_supplier_delivery_loop(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        delivery_task.cancel()
+        try:
+            await delivery_task
+        except asyncio.CancelledError:
+            pass
 if __name__ == "__main__": asyncio.run(main())
