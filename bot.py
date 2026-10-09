@@ -1116,9 +1116,79 @@ async def admin_all_orders(c: CallbackQuery):
     if page > 0: nav.append(InlineKeyboardButton(text="⬅️ Previous", callback_data=f"admin:all_orders:{group}:{page-1}"))
     if page+1 < pages: nav.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"admin:all_orders:{group}:{page+1}"))
     if nav: keyboard.append(nav)
+    # Status lookup only: never creates or re-submits a supplier order.
+    if group in ("all", "processing"):
+        for order_row in rows:
+            if order_group(order_row[5]) == "processing":
+                keyboard.append([InlineKeyboardButton(
+                    text=f"🔄 Check Supplier Status #{order_row[0]}",
+                    callback_data=f"admin:check_supplier:{order_row[0]}")])
     keyboard.append([InlineKeyboardButton(text="🔙 Admin Menu", callback_data="admin:all_orders_back")])
     await c.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await c.answer()
+
+# Only the supplier-status/delivery check is added to the existing order list.
+_supplier_check_locks = {}
+
+@dp.callback_query(F.data.startswith("admin:check_supplier:"))
+async def admin_check_supplier_status(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    try:
+        oid = int(c.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await c.answer("Invalid order", show_alert=True)
+    await c.answer("Checking supplier status...")
+    lock = _supplier_check_locks.setdefault(oid, asyncio.Lock())
+    async with lock:
+        async with aiosqlite.connect(DB) as db:
+            row = await (await db.execute(
+                "SELECT telegram_id,supplier_order_id,status FROM orders WHERE id=?", (oid,)
+            )).fetchone()
+        if not row:
+            return await c.message.answer(f"⚠️ Order #{oid} not found.")
+        uid, sid, current = row
+        if not sid:
+            return await c.message.answer(
+                f"⚠️ Order #{oid} has no saved Supplier Order ID. "
+                "Do not submit another order; check supplier records first.")
+        if order_group(current) == "delivered":
+            return await c.message.answer(f"✅ Order #{oid} is already marked Delivered. No duplicate delivery sent.")
+        try:
+            result = await vente.order(sid)  # GET only; does not charge supplier
+        except VenteBotError as e:
+            return await c.message.answer(f"⚠️ Supplier status check failed for #{oid}: {e}")
+        if not isinstance(result, dict):
+            return await c.message.answer(f"⚠️ Unexpected supplier response for Order #{oid}.")
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        supplier_status = str(result.get("status") or data.get("status") or current)
+        delivery = next((v for v in (
+            result.get("delivery"), result.get("credentials"), result.get("account"),
+            data.get("delivery"), data.get("credentials"), data.get("account")
+        ) if v), None)
+        if delivery:
+            # Send before marking delivered; a failed Telegram send stays retryable.
+            try:
+                from html import escape
+                payload = escape(delivery if isinstance(delivery, str) else json.dumps(delivery, ensure_ascii=False))
+                await c.bot.send_message(uid, f"🎉 <b>Order #{oid} Delivered</b>\n\n{payload}", parse_mode="HTML")
+            except Exception:
+                return await c.message.answer(
+                    f"⚠️ Supplier returned delivery for Order #{oid}, but customer notification failed. "
+                    "Order was not marked Delivered; investigate Telegram delivery before retrying.")
+            async with aiosqlite.connect(DB) as db:
+                await db.execute("UPDATE orders SET status='delivered' WHERE id=?", (oid,))
+                await db.commit()
+            return await c.message.answer(f"✅ Order #{oid}: delivery sent to customer and marked Delivered.")
+        # A supplier 'completed' flag alone is not proof of delivered credentials.
+        safe_status = supplier_status if order_group(supplier_status) != "delivered" else "processing"
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("UPDATE orders SET status=? WHERE id=?", (safe_status, oid))
+            await db.commit()
+        await c.message.answer(
+            f"⏳ Order #{oid}\nSupplier status: {supplier_status}\n"
+            "No delivery information returned yet. Supplier order was NOT resubmitted."
+        )
 
 @dp.callback_query(F.data == "admin:all_orders_back")
 async def admin_all_orders_back(c: CallbackQuery):
