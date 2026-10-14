@@ -348,7 +348,13 @@ async def menu_track_order(m: Message):
         rows=await (await db.execute("SELECT id,product_name,status FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 5",(m.from_user.id,))).fetchall()
     if not rows: return await m.answer("You have no orders yet.")
     buttons=[[InlineKeyboardButton(text=f"#{oid} • {str(name or 'Product')[:27]} • {customer_status_label(status)}",callback_data=f"customer:track:{oid}")] for oid,name,status in rows]
-    await m.answer("🔎 Select an order, or send /track ORDER_ID:",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    async with aiosqlite.connect(DB) as db:
+        await db.execute(
+            "INSERT INTO user_input_state(telegram_id,action) VALUES(?, 'customer_track_order') "
+            "ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,order_id=NULL,product_id=NULL,created_at=CURRENT_TIMESTAMP",
+            (m.from_user.id,))
+        await db.commit()
+    await m.answer("🔎 Select an order, or send only your Order ID (example: 16):",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(F.data.startswith("customer:track:"))
 async def customer_track_button(c: CallbackQuery):
@@ -794,6 +800,7 @@ async def admin_products_manage(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 All Products / Edit", callback_data="admin:product_edit")],
         [InlineKeyboardButton(text="➕ Add New Product", callback_data="admin:product_add")],
+        [InlineKeyboardButton(text="💰 Update Product Price", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🔎 Search Product", callback_data="admin:edit_search")],
         [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin:home")],
@@ -2015,6 +2022,13 @@ async def pending_text_input(m: Message):
     if not state: return
     action, oid, pid = state
     text=(m.text or "").strip()
+    if action == "customer_track_order":
+        if not text.isdecimal() or int(text) < 1:
+            return await m.answer("⚠️ Please send only your Order ID, for example: 16")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action='customer_track_order'", (m.from_user.id,))
+            await db.commit()
+        return await show_customer_order(m, int(text))
     if action == "admin_reject_custom":
         if m.from_user.id not in ADMIN_IDS: return
         if not 5 <= len(text) <= 300:
