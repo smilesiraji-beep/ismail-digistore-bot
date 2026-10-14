@@ -404,28 +404,51 @@ def company_logo_id(product_name: str):
 async def product_list_markup():
     items = await catalog_products()
     rows = []
-    last_category = None
+    current_row = []
+    current_width = 0
+
     for p in items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
         name = str(p.get("name") or p.get("title") or "Product")
-        category = api_category_header(name)
-        if category and category != last_category:
-            rows.append([InlineKeyboardButton(text=category, callback_data="products:category_noop")])
-        last_category = category
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
         logo_id = company_logo_id(name)
         prefix = "" if logo_id else (p.get("emoji") or "📦") + " "
-        label = f"{prefix}{name} — {price_text}"
-        if len(label) > 58:
-            max_name = max(8, 55 - len(prefix) - len(price_text))
-            label = f"{prefix}{name[:max_name].rstrip()}… — {price_text}"
+
+        # Compact display labels only; product IDs, prices and callbacks stay intact.
+        # Long product names occupy a full row, medium names share two columns,
+        # and short names may share three columns. Telegram controls final sizing.
+        if len(name) > 27 or len(price_text) > 12:
+            columns = 1
+            max_name = 43
+        elif len(name) > 13:
+            columns = 2
+            max_name = 20
+        else:
+            columns = 3
+            max_name = 13
+        shown_name = name if len(name) <= max_name else name[:max_name - 1].rstrip() + "…"
+        label = f"{prefix}{shown_name} | {price_text}"
         button_options = {"text": label, "callback_data": f"product:{pid}"}
         if logo_id:
             button_options["icon_custom_emoji_id"] = logo_id
-        rows.append([InlineKeyboardButton(**button_options)])
+        button = InlineKeyboardButton(**button_options)
+
+        # Do not mix full-width buttons with narrow ones or overflow a row.
+        if current_row and (columns == 1 or len(current_row) >= columns or current_width + 1 / columns > 1.001):
+            rows.append(current_row)
+            current_row = []
+            current_width = 0
+        current_row.append(button)
+        current_width += 1 / columns
+        if columns == 1 or len(current_row) == columns:
+            rows.append(current_row)
+            current_row = []
+            current_width = 0
+    if current_row:
+        rows.append(current_row)
     rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="products:refresh")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
