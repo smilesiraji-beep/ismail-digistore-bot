@@ -800,7 +800,6 @@ async def admin_products_manage(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 All Products / Edit", callback_data="admin:product_edit")],
         [InlineKeyboardButton(text="➕ Add New Product", callback_data="admin:product_add")],
-        [InlineKeyboardButton(text="💰 Update Product Price", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🔎 Search Product", callback_data="admin:edit_search")],
         [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin:home")],
@@ -927,7 +926,14 @@ async def admin_manage_select(c: CallbackQuery):
             await db.execute("INSERT INTO managed_products(product_id,display_name,enabled) VALUES(?,?,1) "
                              "ON CONFLICT(product_id) DO UPDATE SET enabled=1", (pid, name))
             await db.commit()
-        await c.message.answer(f"✅ Product added to your catalog: {name}\\nSet its selling price from Product Management before selling.")
+        await c.message.answer(
+            f"✅ Product added to your catalog: {escape(name)}\n\n💰 Set the selling price now:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💵 Set Product Price", callback_data=f"admin:price_item:{pid}")],
+                [InlineKeyboardButton(text="⏭️ Skip for Now", callback_data="admin:prices_noop")],
+            ]),
+        )
     elif mode == "edit":
         async with aiosqlite.connect(DB) as db:
             pin_row = await (await db.execute("SELECT pin_order FROM managed_products WHERE product_id=?", (pid,))).fetchone()
