@@ -409,7 +409,7 @@ def company_logo_id(product_name: str):
 
 async def product_list_markup():
     items = await catalog_products()
-    rows = []
+    rows = [[InlineKeyboardButton(text="💬 Manual Purchase — Chat with Admin", url="https://t.me/Ismail0987651")]]
     current_row = []
     current_width = 0
 
