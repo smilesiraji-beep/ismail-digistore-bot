@@ -27,8 +27,10 @@ class LocalCatalog:
     async def products(self, **kwargs):
         async with aiosqlite.connect(DB) as db:
             rows = await (await db.execute("SELECT product_id,display_name,enabled FROM managed_products WHERE enabled=1")).fetchall()
+            availability = dict(await (await db.execute("SELECT product_id,is_available FROM product_availability")).fetchall())
             counts = dict(await (await db.execute("SELECT product_id,COUNT(*) FROM local_stock WHERE order_id IS NULL GROUP BY product_id")).fetchall())
-        return {"products": [{"id": pid, "name": name, "stock": counts.get(pid, 0)} for pid,name,_ in rows]}
+            capacity = dict(await (await db.execute("SELECT product_id,quantity FROM supplier_order_capacity")).fetchall())
+        return {"products": [{"id": pid, "name": name, "stock": counts.get(pid, 0), "order_capacity": capacity.get(pid, 0), "is_available": bool(availability.get(pid, 1))} for pid,name,_ in rows]}
     async def order(self, *args, **kwargs):
         raise VenteBotError("Supplier API disabled. Use local order status.")
     async def quote(self, *args, **kwargs):
@@ -212,6 +214,14 @@ async def init_db():
           created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_local_stock_available ON local_stock(product_id,order_id);
+        CREATE TABLE IF NOT EXISTS supplier_order_capacity(
+          product_id TEXT PRIMARY KEY, quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0)
+        );
+        CREATE TABLE IF NOT EXISTS product_availability(
+          product_id TEXT PRIMARY KEY,
+          is_available INTEGER NOT NULL DEFAULT 1 CHECK(is_available IN (0,1)),
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS local_deliveries(
           order_id INTEGER PRIMARY KEY, telegram_id INTEGER NOT NULL,
           content TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -536,13 +546,18 @@ async def product_details(c: CallbackQuery):
     price = await display_price(p)
     price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
     text = f"<b>{name}</b>\n💵 Price: {price_text}"
+    available = p.get("is_available", True)
+    text += "\n🟢 Available — Fulfilled after payment verification" if available else "\n🔴 Unavailable"
     if stock is not None:
-        text += f"\n📦 Stock: {stock}"
+        text += f"\n📦 Ready stock: {stock}"
+    text += f"\n🛍️ Supplier order capacity: {int(p.get('order_capacity', 0))}"
     if description:
         text += f"\n\n{description}"
     rows = []
-    if isinstance(price, Decimal):
+    if isinstance(price, Decimal) and available:
         rows.append([InlineKeyboardButton(text="🛒 Buy", callback_data=f"buy:{pid}")])
+    elif not available:
+        text += "\n\n⚠️ Ordering is temporarily unavailable."
     else:
         text += "\n\n⚠️ This product is not on sale yet."
     rows.append([InlineKeyboardButton(text="⬅️ Back to Products", callback_data="products:back")])
@@ -555,6 +570,9 @@ async def buy_product(c: CallbackQuery):
     try: p = await get_product(pid)
     except VenteBotError as e: await c.message.answer(f"⚠️ {e}"); return await c.answer()
     if not p: await c.message.answer("Product is no longer available."); return await c.answer()
+    if not p.get("is_available", True):
+        await c.message.answer("🔴 This product is currently unavailable for new orders.")
+        return await c.answer()
     price = await display_price(p)
     if price is None:
         await c.message.answer("⚠️ This product is not on sale yet. Please contact support.")
@@ -574,12 +592,9 @@ async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
     try: p = await get_product(pid)
     except VenteBotError as e: return await c.message.answer(f"⚠️ {e}")
     if not p: return await c.message.answer("Product is no longer available.")
+    if not p.get("is_available", True): return await c.message.answer("🔴 This product is currently unavailable for new orders.")
     price = await display_price(p)
     if price is None: return await c.message.answer("⚠️ This product is not on sale yet.")
-    stock = p.get("stock")
-    try:
-        if stock is not None and int(stock) < qty: return await c.message.answer(f"⚠️ Only {stock} item(s) are in stock.")
-    except (TypeError, ValueError): pass
     name = p.get("name") or p.get("title") or "Product"
     total = price * qty
     idem = str(uuid.uuid4())
@@ -816,6 +831,8 @@ async def admin_products_manage(c: CallbackQuery):
         [InlineKeyboardButton(text="📋 All Products / Edit", callback_data="admin:product_edit")],
         [InlineKeyboardButton(text="➕ Add New Product", callback_data="admin:product_add")],
         [InlineKeyboardButton(text="📦 Stock Management", callback_data="admin:local_stock")],
+        [InlineKeyboardButton(text="🟢🔴 Product Availability", callback_data="admin:availability")],
+        [InlineKeyboardButton(text="🔢 Set Supplier Order Capacity", callback_data="admin:capacity")],
         [InlineKeyboardButton(text="🔎 Search Product", callback_data="admin:edit_search")],
         [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin:home")],
@@ -823,6 +840,69 @@ async def admin_products_manage(c: CallbackQuery):
     await c.message.answer("📦 <b>Product Management</b>\nChoose an option below.\nTo edit a product's price, open All Products / Edit and select the product.", parse_mode="HTML", reply_markup=kb)
     await c.answer()
 
+
+@dp.callback_query(F.data == "admin:capacity")
+async def admin_capacity_list(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
+    items = await catalog_products()
+    rows = [[InlineKeyboardButton(text=str(p.get("name", "Product"))[:42], callback_data=f"admin:capacity_item:{p.get('id')}")] for p in items[:60]]
+    rows.append([InlineKeyboardButton(text="🔙 Product Management", callback_data="admin:products_manage")])
+    await c.message.answer("Select product to set supplier order capacity (not ready inventory):", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:capacity_item:"))
+async def admin_capacity_item(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
+    pid = c.data.split(":", 2)[2]
+    p = await get_product(pid)
+    if not p: return await c.answer("Product not found", show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,product_id) VALUES(?, 'admin_set_capacity', ?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action, product_id=excluded.product_id", (c.from_user.id,pid))
+        await db.commit()
+    await c.message.answer(f"{p.get('name', 'Product')}\nCurrent supplier order capacity: {p.get('order_capacity',0)}\nSend a whole number (0–100000). This is supplier fulfillment capacity, not ready stock.")
+    await c.answer()
+
+@dp.callback_query(F.data == "admin:availability")
+async def admin_availability(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
+    items = await catalog_products()
+    rows = []
+    for product in items:
+        pid = str(product.get("id") or product.get("product_id") or "")
+        if not pid: continue
+        available = product.get("is_available", True)
+        marker = "🟢" if available else "🔴"
+        rows.append([InlineKeyboardButton(text=f"{marker} {str(product.get('name','Product'))[:37]}", callback_data=f"admin:availability_product:{pid}")])
+    rows.append([InlineKeyboardButton(text="🔙 Product Management", callback_data="admin:products_manage")])
+    await c.message.answer("🟢 Available = customer can order, even with zero ready stock.\n🔴 Unavailable = no new orders.\n\nChoose a product:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:availability_product:"))
+async def admin_availability_product(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
+    pid = c.data.split(":",2)[2]
+    p = await get_product(pid)
+    if not p: return await c.answer("Product not found", show_alert=True)
+    status = "🟢 Available" if p.get("is_available",True) else "🔴 Unavailable"
+    await c.message.answer(f"📦 {p.get('name','Product')}\nCurrent: {status}\nChoose availability:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Set Available",callback_data=f"admin:availability_set:1:{pid}")],
+        [InlineKeyboardButton(text="🔴 Set Unavailable",callback_data=f"admin:availability_set:0:{pid}")],
+        [InlineKeyboardButton(text="🔙 Product List",callback_data="admin:availability")]
+    ]))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:availability_set:"))
+async def admin_availability_set(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
+    _, _, _, state, pid = c.data.split(":",4)
+    if state not in ("0","1"): return await c.answer("Invalid state",show_alert=True)
+    p = await get_product(pid)
+    if not p: return await c.answer("Product not found",show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO product_availability(product_id,is_available) VALUES(?,?) ON CONFLICT(product_id) DO UPDATE SET is_available=excluded.is_available, updated_at=CURRENT_TIMESTAMP",(pid,int(state)))
+        await db.commit()
+    await c.message.answer(f"✅ {p.get('name','Product')} is now {'🟢 Available' if state=='1' else '🔴 Unavailable'}.",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Availability List",callback_data="admin:availability")]]))
+    await c.answer()
 
 @dp.callback_query(F.data == "admin:local_stock")
 async def admin_local_stock(c: CallbackQuery):
@@ -2144,6 +2224,15 @@ async def pending_text_input(m: Message):
         return await show_reject_confirmation(m,m.from_user.id,oid,text)
     if action == "admin_reject_confirm":
         return await m.answer("Please use Confirm Reject or Cancel on the previous message.")
+    if action == "admin_set_capacity":
+        if m.from_user.id not in ADMIN_IDS: return
+        if not text.isdecimal() or int(text) > 100000:
+            return await m.answer("Enter a whole number between 0 and 100000.")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("INSERT INTO supplier_order_capacity(product_id,quantity) VALUES(?,?) ON CONFLICT(product_id) DO UPDATE SET quantity=excluded.quantity", (pid,int(text)))
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?", (m.from_user.id,))
+            await db.commit()
+        return await m.answer(f"✅ Supplier order capacity set to {int(text)}. Ready inventory remains unchanged.")
     if action == "admin_add_stock":
         if m.from_user.id not in ADMIN_IDS: return
         if not 3 <= len(text) <= 4000: return await m.answer("Stock content must be 3–4000 characters.")
