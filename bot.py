@@ -708,13 +708,31 @@ async def ask_payment_reference(c: CallbackQuery):
 @dp.message(Command("activate"))
 async def activate(m: Message):
     parts = (m.text or "").split(maxsplit=2)
-    if len(parts) < 3 or not parts[1].isdigit():
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].strip():
         return await m.answer("Use: /activate ORDER_ID EMAIL_OR_USERNAME")
     oid, identifier = int(parts[1]), parts[2].strip()
     async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("UPDATE orders SET activation_identifier=? WHERE id=? AND telegram_id=? AND status IN ('awaiting_payment','payment_submitted')", (identifier, oid, m.from_user.id))
+        row = await (await db.execute(
+            "SELECT supplier_order_id,status FROM orders WHERE id=? AND telegram_id=?",
+            (oid, m.from_user.id))).fetchone()
+    if not row:
+        return await m.answer("⚠️ Order not found.")
+    sid, status = row
+    if order_group(status) in ("delivered", "cancelled") or str(status).lower() in ("payment_rejected",):
+        return await m.answer("⚠️ This order can no longer be changed.")
+    if sid:
+        try:
+            remote = await vente.order(sid)
+            if not supplier_waiting_for_activation(remote):
+                return await m.answer("⚠️ Supplier order is not waiting for an activation identifier.")
+            await vente.submit_activation_identifier(sid, identifier)
+        except VenteBotError as exc:
+            return await m.answer(f"⚠️ Activation identifier was not submitted: {exc}")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE orders SET activation_identifier=? WHERE id=? AND telegram_id=?",
+                         (identifier, oid, m.from_user.id))
         await db.commit()
-    await m.answer("✅ Activation identifier saved." if cur.rowcount else "⚠️ Order not found or can no longer be changed.")
+    await m.answer("✅ Activation identifier saved and submitted to supplier." if sid else "✅ Activation identifier saved.")
 
 @dp.message(Command("admin"))
 async def admin_panel(m: Message):
@@ -1199,8 +1217,8 @@ async def admin_check_supplier_status(c: CallbackQuery):
         if not isinstance(result, dict):
             return await c.message.answer(f"⚠️ Unexpected supplier response for Order #{oid}.")
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        supplier_status = str(result.get("status") or data.get("status") or current)
-        delivery = supplier_delivery_from_response(result)
+        supplier_status = supplier_status_from_response(result, current)
+        delivery = None if supplier_waiting_for_activation(result) else supplier_delivery_from_response(result)
         if delivery:
             # Send before marking delivered; a failed Telegram send stays retryable.
             try:
@@ -1242,6 +1260,22 @@ async def admin_pending(c: CallbackQuery):
             keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}", callback_data=f"admin:approve:{oid}"), InlineKeyboardButton(text=f"❌ Reject #{oid}", callback_data=f"admin:reject:{oid}")]])
             await c.message.answer(f"🧾 #{oid} • {name or 'Product'}\\n👤 {uid}\\n💵 ${amount or '—'}\\n💳 {method or 'binance'} Ref: {ref or '—'}\\n🔑 ID: {act or 'Not supplied'}", reply_markup=keys)
     await c.answer()
+
+def supplier_status_from_response(result, fallback="processing"):
+    """Read the nested order status, not the top-level API transport status 'ok'."""
+    if not isinstance(result, dict):
+        return fallback
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    order = result.get("order") if isinstance(result.get("order"), dict) else data.get("order")
+    if isinstance(order, dict) and order.get("status"):
+        return str(order["status"])
+    status = result.get("status") or data.get("status")
+    return str(status) if status and str(status).lower() != "ok" else fallback
+
+
+def supplier_waiting_for_activation(result):
+    return supplier_status_from_response(result).upper() in {"AWAITING_ACTIVATION", "WAITING_ACTIVATION", "PENDING_ACTIVATION"}
+
 
 # Supplier recovery helpers: read-only lookups; never place or charge for an order.
 def supplier_order_id_from_response(result):
@@ -1313,7 +1347,7 @@ async def recover_supplier_order(m: Message):
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     remote = data.get("order") if isinstance(data.get("order"), dict) else data
     remote_name = str(remote.get("product_name") or remote.get("product") or result.get("product_name") or "Not provided")
-    remote_status = str(remote.get("status") or result.get("status") or "Not provided")
+    remote_status = supplier_status_from_response(result, "Not provided")
     await m.answer(
         f"⚠️ Confirm supplier order mapping\n\nYour order: #{oid} — {row[0]} (qty {row[1]})\n"
         f"Supplier order: #{sid}\nSupplier product: {remote_name}\nSupplier status: {remote_status}\n\n"
@@ -1374,7 +1408,7 @@ async def submit_supplier_order(oid: int):
     result=await vente.create_order(pid, qty, activation, f"digistore-{oid}-user-{uid}", idem)
     data=(result.get("data") or {}) if isinstance(result,dict) else {}
     supplier_id=supplier_order_id_from_response(result)
-    status=(result.get("status") or data.get("status") or "submitted") if isinstance(result,dict) else "submitted"
+    status=supplier_status_from_response(result, "submitted")
     async with aiosqlite.connect(DB) as db:
         await db.execute("UPDATE orders SET supplier_order_id=?, status=? WHERE id=?", (supplier_id,status,oid)); await db.commit()
     if not supplier_id:
@@ -1461,8 +1495,8 @@ async def send_delivery_if_ready(bot: Bot, oid: int, uid: int, supplier_id: str)
         try: result = await vente.order(supplier_id)
         except VenteBotError: continue
         data=(result.get("data") or {}) if isinstance(result,dict) else {}
-        status=(result.get("status") or data.get("status") or "processing") if isinstance(result,dict) else "processing"
-        delivery=supplier_delivery_from_response(result)
+        status=supplier_status_from_response(result, "processing")
+        delivery=None if supplier_waiting_for_activation(result) else supplier_delivery_from_response(result)
         async with aiosqlite.connect(DB) as db:
             previous=(await (await db.execute("SELECT status FROM orders WHERE id=?",(oid,))).fetchone())
             await db.execute("UPDATE orders SET status=? WHERE id=?",(str(status),oid)); await db.commit()
@@ -1594,7 +1628,7 @@ async def refresh_status(m: Message):
     try: result=await vente.order(row[1])
     except VenteBotError as e: return await m.answer(f"⚠️ Could not refresh status: {e}")
     data=(result.get("data") or {}) if isinstance(result,dict) else {}
-    status=(result.get("status") or data.get("status") or row[2]) if isinstance(result,dict) else row[2]
+    status=supplier_status_from_response(result, row[2])
     delivery=(result.get("delivery") or result.get("credentials") or data.get("delivery") or data.get("credentials")) if isinstance(result,dict) else None
     async with aiosqlite.connect(DB) as db:
         await db.execute("UPDATE orders SET status=? WHERE id=?",(str(status),oid)); await db.commit()
@@ -2138,7 +2172,7 @@ async def automatic_supplier_delivery_pass(bot: Bot):
                 continue
             try:
                 result = await vente.order(sid)  # GET only: never purchase again
-                delivery = supplier_delivery_from_response(result)
+                delivery = None if supplier_waiting_for_activation(result) else supplier_delivery_from_response(result)
                 if not delivery:
                     continue
                 await send_premium_customer_delivery(bot, oid, uid, delivery)
