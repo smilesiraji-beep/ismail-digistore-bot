@@ -275,25 +275,23 @@ def group_products_by_name(items, overrides):
 
 
 async def catalog_products():
-    """Preserve original approved products, with admin-added supplier IDs and visibility overrides."""
+    """Use exactly the supplier's current catalog in the supplier's original order.
+
+    Local admin price overrides remain in the prices table; local product records
+    do not add extra items or remove supplier items from the customer catalog.
+    """
     raw = extract_products(await vente.products(lang="en"))
-    async with aiosqlite.connect(DB) as db:
-        rows = await (await db.execute("SELECT product_id,display_name,enabled,pin_order FROM managed_products")).fetchall()
-    overrides = {str(pid): (name, enabled, pin_order) for pid, name, enabled, pin_order in rows}
-    selected = []
-    for product in raw:
-        pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
-        original = str(product.get("name") or product.get("title") or "")
-        record = overrides.get(pid)
-        if record and not record[1]:
-            continue
-        if canonical_storebat_name(original) or (record and record[1]):
-            item = dict(product)
-            item["name"] = (record[0] if record and record[0] else canonical_storebat_name(original) or original)
-            selected.append(item)
-    # Same-name variants stay together in both customer and admin listings.
-    # A pinned product brings its whole family to the top.
-    return group_products_by_name(selected, overrides)
+    return [dict(product) for product in raw if isinstance(product, dict)]
+
+
+def supplier_category(product: dict) -> str:
+    """Read only an actual supplier-provided category, never guess one."""
+    category = product.get("category") or product.get("category_name")
+    if isinstance(category, dict):
+        category = category.get("name") or category.get("title")
+    if not isinstance(category, str):
+        return ""
+    return category.strip()[:55]
 
 
 async def get_product(product_id: str):
@@ -412,11 +410,22 @@ async def product_list_markup():
     rows = [[InlineKeyboardButton(text="💬 Manual Purchase — Chat with Admin", url="https://t.me/Ismail0987651")]]
     current_row = []
     current_width = 0
+    previous_category = None
 
     for p in items:
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if not pid:
             continue
+        category = supplier_category(p)
+        if category and category != previous_category:
+            if current_row:
+                rows.append(current_row)
+                current_row = []
+                current_width = 0
+            rows.append([InlineKeyboardButton(
+                text=f"📂 {category}", callback_data="products:category_noop"
+            )])
+        previous_category = category
         name = str(p.get("name") or p.get("title") or "Product")
         price = await display_price(p)
         price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
@@ -582,8 +591,11 @@ async def create_customer_order(c: CallbackQuery, pid: str, qty: int):
         f"🛒 <b>ORDER SUMMARY</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"🧾 <b>Order ID:</b> #{oid}\n\n"
-        f"📦 <b>Product:</b> {name}\n"
-        f"🔢 <b>Quantity:</b> {qty}\n\n"
+        f"📦 <b>Product:</b> {escape(str(name))}\n"
+        f"🔢 <b>Quantity:</b> {qty}\n"
+        + (f"📦 <b>Stock:</b> {escape(str(stock))}\n" if stock is not None else "")
+        + (f"\n📝 <b>Description:</b>\n{clean_supplier_text(p.get('description'))[:1800]}\n" if p.get('description') else "")
+        + f"\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>TOTAL: ${total:.2f}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
