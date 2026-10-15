@@ -274,6 +274,12 @@ def group_products_by_name(items, overrides):
     return result
 
 
+def is_supplier_test_product(product: dict) -> bool:
+    """Exclude the supplier's synthetic API test item from customer catalog."""
+    name = str(product.get("name") or product.get("title") or "").strip().casefold()
+    return product.get("api_test") is True or name == "ventebot api test product"
+
+
 async def catalog_products():
     """Use exactly the supplier's current catalog in the supplier's original order.
 
@@ -281,7 +287,7 @@ async def catalog_products():
     do not add extra items or remove supplier items from the customer catalog.
     """
     raw = extract_products(await vente.products(lang="en"))
-    return [dict(product) for product in raw if isinstance(product, dict)]
+    return [dict(product) for product in raw if isinstance(product, dict) and not is_supplier_test_product(product)]
 
 
 def supplier_category(product: dict) -> str:
@@ -297,6 +303,8 @@ def supplier_category(product: dict) -> str:
 async def get_product(product_id: str):
     data = await vente.products(lang="en")
     for p in extract_products(data):
+        if is_supplier_test_product(p):
+            continue
         pid = str(p.get("id") or p.get("product_id") or p.get("uuid") or "")
         if pid == str(product_id):
             return p
@@ -407,6 +415,17 @@ def company_logo_id(product_name: str):
 
 async def product_list_markup():
     items = await catalog_products()
+    # Admin-managed pins override the supplier's display order, but never
+    # change which products are present in the supplier catalog.
+    async with aiosqlite.connect(DB) as db:
+        pin_rows = await (await db.execute(
+            "SELECT product_id, pin_order FROM managed_products WHERE pin_order > 0"
+        )).fetchall()
+    pinned_order = {str(product_id): int(order) for product_id, order in pin_rows}
+    # Stable sort: most recently pinned first; unpinned retain supplier order.
+    items.sort(key=lambda product: -pinned_order.get(
+        str(product.get("id") or product.get("product_id") or product.get("uuid") or ""), 0
+    ))
     rows = [[InlineKeyboardButton(text="💬 Manual Purchase — Chat with Admin", url="https://t.me/Ismail0987651")]]
     current_row = []
     current_width = 0
@@ -923,7 +942,7 @@ async def admin_manage_search(m, term, mode):
     if len(term) < 2:
         return await m.answer("Enter at least 2 characters.")
     try:
-        products = extract_products(await vente.products(lang="en")) if mode == "add" else await catalog_products()
+        products = await catalog_products()
     except VenteBotError:
         return await m.answer("⚠️ Supplier catalog unavailable.")
     rows = []
