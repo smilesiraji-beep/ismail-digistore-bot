@@ -22,7 +22,20 @@ BKASH_NUMBER = os.getenv("BKASH_NUMBER", "01785477501")
 NAGAD_NUMBER = os.getenv("NAGAD_NUMBER", "01785477501")
 BDT_PER_USD = "131"  # Fixed local checkout conversion rate; Binance remains in USD
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-vente = VenteBotClient()
+# Local inventory mode: no supplier API client is initialized.
+class LocalCatalog:
+    async def products(self, **kwargs):
+        async with aiosqlite.connect(DB) as db:
+            rows = await (await db.execute("SELECT product_id,display_name,enabled FROM managed_products WHERE enabled=1")).fetchall()
+            counts = dict(await (await db.execute("SELECT product_id,COUNT(*) FROM local_stock WHERE order_id IS NULL GROUP BY product_id")).fetchall())
+        return {"products": [{"id": pid, "name": name, "stock": counts.get(pid, 0)} for pid,name,_ in rows]}
+    async def order(self, *args, **kwargs):
+        raise VenteBotError("Supplier API disabled. Use local order status.")
+    async def quote(self, *args, **kwargs):
+        raise VenteBotError("Supplier API disabled.")
+    async def create_order(self, *args, **kwargs):
+        raise VenteBotError("Supplier API disabled.")
+vente = LocalCatalog()
 
 kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🛍️ Shop Products")],
@@ -189,6 +202,21 @@ async def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_reference
           ON orders(payment_reference) WHERE payment_reference IS NOT NULL;
         ''')
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS local_stock(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('account','license','link')),
+          secret TEXT NOT NULL,
+          order_id INTEGER,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_stock_available ON local_stock(product_id,order_id);
+        CREATE TABLE IF NOT EXISTS local_deliveries(
+          order_id INTEGER PRIMARY KEY, telegram_id INTEGER NOT NULL,
+          content TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """)
         # Safe upgrades from older DB versions.
         cols = {r[1] for r in await (await db.execute("PRAGMA table_info(orders)")).fetchall()}
         for name, ddl in {
@@ -275,25 +303,12 @@ def group_products_by_name(items, overrides):
 
 
 async def catalog_products():
-    """Preserve original approved products, with admin-added supplier IDs and visibility overrides."""
+    """Locally managed products only; no remote supplier calls."""
     raw = extract_products(await vente.products(lang="en"))
     async with aiosqlite.connect(DB) as db:
         rows = await (await db.execute("SELECT product_id,display_name,enabled,pin_order FROM managed_products")).fetchall()
-    overrides = {str(pid): (name, enabled, pin_order) for pid, name, enabled, pin_order in rows}
-    selected = []
-    for product in raw:
-        pid = str(product.get("id") or product.get("product_id") or product.get("uuid") or "")
-        original = str(product.get("name") or product.get("title") or "")
-        record = overrides.get(pid)
-        if record and not record[1]:
-            continue
-        if canonical_storebat_name(original) or (record and record[1]):
-            item = dict(product)
-            item["name"] = (record[0] if record and record[0] else canonical_storebat_name(original) or original)
-            selected.append(item)
-    # Same-name variants stay together in both customer and admin listings.
-    # A pinned product brings its whole family to the top.
-    return group_products_by_name(selected, overrides)
+    overrides = {str(pid): (name, enabled, pin_order) for pid,name,enabled,pin_order in rows}
+    return group_products_by_name(raw, overrides)
 
 
 async def get_product(product_id: str):
@@ -800,6 +815,7 @@ async def admin_products_manage(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 All Products / Edit", callback_data="admin:product_edit")],
         [InlineKeyboardButton(text="➕ Add New Product", callback_data="admin:product_add")],
+        [InlineKeyboardButton(text="📦 Stock Management", callback_data="admin:local_stock")],
         [InlineKeyboardButton(text="🔎 Search Product", callback_data="admin:edit_search")],
         [InlineKeyboardButton(text="💵 Product Prices", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin:home")],
@@ -808,12 +824,54 @@ async def admin_products_manage(c: CallbackQuery):
     await c.answer()
 
 
+@dp.callback_query(F.data == "admin:local_stock")
+async def admin_local_stock(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    items=await catalog_products()
+    rows=[]
+    for p in items[:60]:
+        pid=str(p.get("id"))
+        rows.append([InlineKeyboardButton(text=f"📦 {str(p.get('name','Product'))[:38]} — {p.get('stock',0)} available",callback_data=f"admin:stock_product:{pid}")])
+    if not rows: return await c.message.answer("No products yet. Use ➕ Add New Product first.")
+    await c.message.answer("📦 Choose a product to add stock:",reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:stock_product:"))
+async def admin_stock_product(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    pid=c.data.rsplit(":",1)[1]
+    await c.message.answer("Choose the stock type:",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Email / Password Account",callback_data=f"admin:stock_kind:account:{pid}")],
+        [InlineKeyboardButton(text="🔑 License Key",callback_data=f"admin:stock_kind:license:{pid}")],
+        [InlineKeyboardButton(text="🔗 Activation Link",callback_data=f"admin:stock_kind:link:{pid}")]]))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:stock_kind:"))
+async def admin_stock_kind(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized",show_alert=True)
+    _,_,kind,pid=c.data.split(":",3)
+    async with aiosqlite.connect(DB) as db:
+        exists=await (await db.execute("SELECT 1 FROM managed_products WHERE product_id=?",(pid,))).fetchone()
+        if not exists: return await c.answer("Product not found",show_alert=True)
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,product_id,product_name) VALUES(?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action,product_id=excluded.product_id,product_name=excluded.product_name,created_at=CURRENT_TIMESTAMP",(c.from_user.id,"admin_add_stock",pid,kind))
+        await db.commit()
+    await c.message.answer("Send ONE stock item as a message. For accounts, use Email: ... Password: ...\nFor license, send the key. For activation link, send the URL.\nUse /cancelstock to cancel.\n⚠️ Only send credentials in your private admin chat.")
+    await c.answer()
+
+@dp.message(Command("cancelstock"))
+async def cancel_stock(m: Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action='admin_add_stock'",(m.from_user.id,))
+        await db.commit()
+    await m.answer("Stock entry cancelled.")
+
 @dp.callback_query(F.data == "admin:product_add")
 async def admin_product_add(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
     await set_admin_product_state(c.from_user.id, "admin_add_search")
-    await c.message.answer("➕ Send a supplier product name to search VenteBot catalog. You can only add products that exist at the supplier.")
+    await c.message.answer("➕ Send your new product name (2–100 characters). You will set its selling price next.")
     await c.answer()
 
 
@@ -1134,7 +1192,7 @@ async def admin_all_orders(c: CallbackQuery):
                       "Unpaid" if status == "awaiting_payment" else
                       "Rejected" if status == "payment_rejected" else
                       "Cancelled" if status == "cancelled" else
-                      "Approved / supplier processing" if order_group(status) == "processing" else
+                      "Approved / processing" if order_group(status) == "processing" else
                       "Approved / delivered" if order_group(status) == "delivered" else "Check order")
         lines.extend(["", "━━━━━━━━━━━━━━━━━━", f"🧾 Order ID: #{oid}",
                       f"📦 Product: {product or '—'}", f"🔢 Quantity: {qty or 1}",
@@ -1170,6 +1228,7 @@ _supplier_check_locks = {}
 
 @dp.callback_query(F.data.startswith("admin:check_supplier:"))
 async def admin_check_supplier_status(c: CallbackQuery):
+    return await c.answer("Supplier integration disabled. Use local order status.", show_alert=True)
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
     try:
@@ -1289,6 +1348,7 @@ def supplier_delivery_from_response(result):
 
 @dp.message(Command("recover_supplier"))
 async def recover_supplier_order(m: Message):
+    return await m.answer("Supplier integration disabled; use /deliver ORDER_ID.")
     if m.from_user.id not in ADMIN_IDS:
         return
     args = (m.text or "").split()
@@ -1334,6 +1394,7 @@ async def cancel_supplier_link(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("admin:link_supplier:"))
 async def confirm_supplier_link(c: CallbackQuery):
+    return await c.answer("Supplier integration disabled.", show_alert=True)
     if c.from_user.id not in ADMIN_IDS:
         return await c.answer("Not authorized", show_alert=True)
     try:
@@ -1420,15 +1481,13 @@ async def customer_delivery_download(c: CallbackQuery):
         row = await (await db.execute(
             "SELECT product_name,quantity,amount_usd,created_at,supplier_order_id,status "
             "FROM orders WHERE id=? AND telegram_id=?", (oid, c.from_user.id))).fetchone()
-    if not row or order_group(row[5]) != "delivered" or not row[4]:
+    if not row or order_group(row[5]) != "delivered":
         return await c.answer("Delivery not available for this order", show_alert=True)
-    try:
-        result = await vente.order(row[4])  # GET only; no new purchase
-        delivery = supplier_delivery_from_response(result)
-    except VenteBotError:
-        delivery = None
+    async with aiosqlite.connect(DB) as db:
+        saved=await (await db.execute("SELECT content FROM local_deliveries WHERE order_id=? AND telegram_id=?",(oid,c.from_user.id))).fetchone()
+    delivery=saved[0] if saved else None
     if not delivery:
-        return await c.answer("Delivery file temporarily unavailable. Please contact support.", show_alert=True)
+        return await c.answer("No local delivery file for this order. Contact support.", show_alert=True)
     payload = delivery if isinstance(delivery, str) else json.dumps(delivery, ensure_ascii=False)
     content = (f"Ismail DigiStore — Order #{oid}\n"
                f"Product: {row[0] or 'Product'}\nQuantity: {row[1]}\n"
@@ -1477,18 +1536,77 @@ async def send_delivery_if_ready(bot: Bot, oid: int, uid: int, supplier_id: str)
             return True
     return False
 
+async def approve_local_order(bot: Bot, oid: int):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT telegram_id,product_id,quantity,status FROM orders WHERE id=?",(oid,))).fetchone()
+        if not row or row[3] != "payment_submitted":
+            await db.rollback(); return None, "Order is not awaiting payment approval."
+        uid,pid,qty,_=row
+        stock=await (await db.execute("SELECT id,kind,secret FROM local_stock WHERE product_id=? AND order_id IS NULL ORDER BY id LIMIT ?",(pid,qty))).fetchall()
+        if len(stock) < qty:
+            await db.execute("UPDATE orders SET status='awaiting_stock' WHERE id=? AND status='payment_submitted'",(oid,))
+            await db.commit()
+            return uid, f"Payment approved, but only {len(stock)}/{qty} stock available. Add stock, then use /deliver {oid}."
+        payload="\n\n".join(f"{kind.upper()}: {secret}" for _,kind,secret in stock)
+        for item_id,_,_ in stock:
+            await db.execute("UPDATE local_stock SET order_id=? WHERE id=? AND order_id IS NULL",(oid,item_id))
+        await db.execute("INSERT INTO local_deliveries(order_id,telegram_id,content) VALUES(?,?,?)",(oid,uid,payload))
+        await db.execute("UPDATE orders SET status='delivery_pending' WHERE id=?",(oid,))
+        await db.commit()
+    try:
+        await send_premium_customer_delivery(bot,oid,uid,payload)
+    except Exception:
+        return uid, "Stock allocated; Telegram delivery failed. Use /deliver ORDER_ID to retry."
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("UPDATE orders SET status='delivered' WHERE id=? AND status='delivery_pending'",(oid,))
+        await db.commit()
+    return uid,"Delivered from local stock successfully."
+
+@dp.message(Command("deliver"))
+async def retry_local_delivery(m: Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    parts=(m.text or "").split()
+    if len(parts)!=2 or not parts[1].isdigit(): return await m.answer("Usage: /deliver ORDER_ID")
+    oid=int(parts[1])
+    async with aiosqlite.connect(DB) as db:
+        row=await (await db.execute("SELECT telegram_id,content FROM local_deliveries WHERE order_id=?",(oid,))).fetchone()
+        state=await (await db.execute("SELECT status FROM orders WHERE id=?",(oid,))).fetchone()
+        if not row and state and state[0]=='awaiting_stock':
+            await db.execute("UPDATE orders SET status='payment_submitted' WHERE id=?",(oid,)); await db.commit()
+    if row:
+        if state and state[0]=='delivered': return await m.answer("Already delivered. No duplicate sent.")
+        try: await send_premium_customer_delivery(m.bot,oid,row[0],row[1])
+        except Exception: return await m.answer("Customer notification failed. Retry later.")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("UPDATE orders SET status='delivered' WHERE id=?",(oid,)); await db.commit()
+        return await m.answer(f"✅ Order #{oid} delivered.")
+    uid,msg=await approve_local_order(m.bot,oid)
+    await m.answer(f"Order #{oid}: {msg}")
+
+@dp.message(Command("addstock"))
+async def add_local_stock(m: Message):
+    if m.from_user.id not in ADMIN_IDS: return
+    parts=(m.text or "").split(maxsplit=3)
+    if len(parts)<4 or parts[2].lower() not in ('account','license','link') or not parts[3].strip():
+        return await m.answer("Usage: /addstock PRODUCT_ID account|license|link SECRET\nExample: /addstock local_xxx license XXXX-YYYY")
+    pid,kind,secret=parts[1],parts[2].lower(),parts[3].strip()
+    async with aiosqlite.connect(DB) as db:
+        exists=await (await db.execute("SELECT 1 FROM managed_products WHERE product_id=?",(pid,))).fetchone()
+        if not exists: return await m.answer("Unknown product ID. Open Product Prices to find your product.")
+        await db.execute("INSERT INTO local_stock(product_id,kind,secret) VALUES(?,?,?)",(pid,kind,secret))
+        await db.commit()
+    await m.answer("✅ Stock saved securely in the bot database. Do not share stock details in public chats.")
+
 @dp.callback_query(F.data.startswith("admin:approve:"))
 async def admin_approve_button(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
     oid=int(c.data.rsplit(":",1)[1])
-    try: uid,sid,status=await submit_supplier_order(oid)
-    except VenteBotError as e: await c.message.answer(f"⚠️ Supplier order was NOT created: {e}"); return await c.answer()
-    await c.message.answer(f"✅ Payment approved. Order #{oid} sent to supplier. Supplier ID: {sid or 'not returned'}")
-    try:
-        await c.bot.send_message(uid, f"✅ Payment approved for Order #{oid}. Your product is now being processed.")
-        delivered = await send_delivery_if_ready(c.bot, oid, uid, sid)
-        if not delivered: await c.bot.send_message(uid, "⏳ Supplier is still processing this order. Delivery will appear when available.")
-    except Exception: pass
+    uid,message=await approve_local_order(c.bot,oid)
+    await c.message.answer(f"📦 Order #{oid}: {message}")
+    if uid and 'stock available' in message:
+        try: await c.bot.send_message(uid,f"✅ Payment approved for Order #{oid}. Waiting for stock.")
+        except Exception: pass
     await c.answer()
 
 # Payment rejection reason choices; existing approval and supplier logic are untouched.
@@ -1590,25 +1708,12 @@ async def refresh_status(m: Message):
     async with aiosqlite.connect(DB) as db:
         row=await (await db.execute("SELECT telegram_id,supplier_order_id,status FROM orders WHERE id=?",(oid,))).fetchone()
     if not row or (m.from_user.id!=row[0] and m.from_user.id not in ADMIN_IDS): return await m.answer("Order not found.")
-    if not row[1]: return await m.answer(f"Order #{oid} status: {row[2]}")
-    try: result=await vente.order(row[1])
-    except VenteBotError as e: return await m.answer(f"⚠️ Could not refresh status: {e}")
-    data=(result.get("data") or {}) if isinstance(result,dict) else {}
-    status=(result.get("status") or data.get("status") or row[2]) if isinstance(result,dict) else row[2]
-    delivery=(result.get("delivery") or result.get("credentials") or data.get("delivery") or data.get("credentials")) if isinstance(result,dict) else None
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("UPDATE orders SET status=? WHERE id=?",(str(status),oid)); await db.commit()
-    if str(status).lower()!=str(row[2]).lower():
-        try: await m.bot.send_message(row[0],f"📦 Order #{oid} updated: {customer_status_label(status)}")
-        except Exception: pass
-    text=f"📦 Order #{oid}\\nStatus: {status}"
-    if delivery: text += f"\\n\\n🎁 Delivery:\\n{delivery}"
-    await m.answer(text)
+    return await m.answer(f"📦 Order #{oid} status: {row[2]}")
 
 @dp.callback_query(F.data == "admin:status_help")
 async def admin_status_help(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return await c.answer("Not authorized", show_alert=True)
-    await c.message.answer("Use /status ORDER_ID to refresh an order directly from VenteBot.")
+    await c.message.answer("Use /status ORDER_ID to view local order status.")
     await c.answer()
 
 @dp.message(Command("paid"))
@@ -1620,7 +1725,7 @@ async def paid(m: Message):
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute("UPDATE orders SET payment_reference=?, status='payment_submitted' WHERE id=? AND telegram_id=? AND status='awaiting_payment'", (ref, oid, m.from_user.id))
         await db.commit()
-    await m.answer("✅ Payment reference submitted. Admin will verify it before the supplier order is created." if cur.rowcount else "⚠️ Order not found or payment was already submitted.")
+    await m.answer("✅ Payment reference submitted. Admin will verify it before delivery." if cur.rowcount else "⚠️ Order not found or payment was already submitted.")
 
 @dp.message(Command("setpayment"))
 async def setpayment(m: Message):
@@ -1696,11 +1801,8 @@ async def approve(m: Message):
     if len(parts)>2:
         async with aiosqlite.connect(DB) as db:
             await db.execute("UPDATE orders SET activation_identifier=? WHERE id=?",(parts[2].strip(),oid)); await db.commit()
-    try: uid,sid,status=await submit_supplier_order(oid)
-    except VenteBotError as e: return await m.answer(f"⚠️ Supplier order was NOT created: {e}")
-    await m.answer(f"✅ Order #{oid} submitted to supplier. Supplier ID: {sid or 'returned without ID'}")
-    try: await m.bot.send_message(uid, f"✅ Payment approved. Order #{oid} has been submitted for delivery. Status: {status}")
-    except Exception: pass
+    uid,message=await approve_local_order(m.bot,oid)
+    await m.answer(f"📦 Order #{oid}: {message}")
 
 @dp.message(Command("setoffer"))
 async def setoffer(m: Message):
@@ -2042,8 +2144,29 @@ async def pending_text_input(m: Message):
         return await show_reject_confirmation(m,m.from_user.id,oid,text)
     if action == "admin_reject_confirm":
         return await m.answer("Please use Confirm Reject or Cancel on the previous message.")
+    if action == "admin_add_stock":
+        if m.from_user.id not in ADMIN_IDS: return
+        if not 3 <= len(text) <= 4000: return await m.answer("Stock content must be 3–4000 characters.")
+        async with aiosqlite.connect(DB) as db:
+            row=await (await db.execute("SELECT product_name FROM user_input_state WHERE telegram_id=? AND action='admin_add_stock'",(m.from_user.id,))).fetchone()
+            if not row or row[0] not in ('account','license','link'): return
+            await db.execute("INSERT INTO local_stock(product_id,kind,secret) VALUES(?,?,?)",(pid,row[0],text))
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?",(m.from_user.id,))
+            await db.commit()
+        try: await m.delete()  # Reduce credential exposure in the Telegram admin chat.
+        except Exception: pass
+        return await m.answer("✅ One stock item saved. Use Stock Management to add another.")
     if action == "admin_add_search":
-        return await admin_manage_search(m, text, "add")
+        if m.from_user.id not in ADMIN_IDS: return
+        if not 2 <= len(text) <= 100: return await m.answer("Product name must be 2–100 characters.")
+        pid = "local_" + uuid.uuid4().hex[:20]
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("INSERT INTO managed_products(product_id,display_name,enabled) VALUES(?,?,1)", (pid,text))
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?", (m.from_user.id,))
+            await db.commit()
+        return await m.answer(f"✅ Product added: {text}\nNow set its selling price:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💵 Set Product Price",callback_data=f"admin:price_item:{pid}")],
+            [InlineKeyboardButton(text="⏭️ Skip for Now",callback_data="admin:prices_noop")]]))
     if action == "admin_edit_search":
         return await admin_manage_search(m, text, "edit")
     if action == "admin_rename_product":
@@ -2104,7 +2227,7 @@ async def pending_text_input(m: Message):
             if cur.rowcount: await db.execute("DELETE FROM user_input_state WHERE telegram_id=?",(m.from_user.id,))
             await db.commit()
         if not cur.rowcount: return await m.answer("⚠️ This order is no longer awaiting payment.")
-        await m.answer(f"✅ Transaction reference received for Order #{oid}.\n\n⏳ Payment is waiting for admin verification. The supplier will NOT be charged until you are approved.")
+        await m.answer(f"✅ Transaction reference received for Order #{oid}.\n\n⏳ Payment is waiting for admin verification. Delivery begins only after admin approval.")
         # Push the pending payment directly to every admin.
         async with aiosqlite.connect(DB) as db:
             row=await (await db.execute("SELECT product_name,amount_usd,activation_identifier,payment_method FROM orders WHERE id=?",(oid,))).fetchone()
@@ -2167,13 +2290,12 @@ async def main():
     if not TOKEN or "PASTE_" in TOKEN: raise RuntimeError("Set BOT_TOKEN in .env before starting the bot.")
     await init_db()
     bot = Bot(TOKEN)
-    delivery_task = asyncio.create_task(automatic_supplier_delivery_loop(bot))
+    delivery_task = None
     try:
         await dp.start_polling(bot)
     finally:
-        delivery_task.cancel()
-        try:
-            await delivery_task
-        except asyncio.CancelledError:
-            pass
+        if delivery_task:
+            delivery_task.cancel()
+            try: await delivery_task
+            except asyncio.CancelledError: pass
 if __name__ == "__main__": asyncio.run(main())
