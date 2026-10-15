@@ -26,11 +26,11 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 class LocalCatalog:
     async def products(self, **kwargs):
         async with aiosqlite.connect(DB) as db:
-            rows = await (await db.execute("SELECT product_id,display_name,enabled FROM managed_products WHERE enabled=1")).fetchall()
+            rows = await (await db.execute("SELECT product_id,display_name,enabled,COALESCE(description, '') FROM managed_products WHERE enabled=1")).fetchall()
             availability = dict(await (await db.execute("SELECT product_id,is_available FROM product_availability")).fetchall())
             counts = dict(await (await db.execute("SELECT product_id,COUNT(*) FROM local_stock WHERE order_id IS NULL GROUP BY product_id")).fetchall())
             capacity = dict(await (await db.execute("SELECT product_id,quantity FROM supplier_order_capacity")).fetchall())
-        return {"products": [{"id": pid, "name": name, "stock": counts.get(pid, 0), "order_capacity": capacity.get(pid, 0), "is_available": bool(availability.get(pid, 1))} for pid,name,_ in rows]}
+        return {"products": [{"id": pid, "name": name, "stock": counts.get(pid, 0), "order_capacity": capacity.get(pid, 0), "is_available": bool(availability.get(pid, 1)), "description": desc} for pid,name,_,desc in rows]}
     async def order(self, *args, **kwargs):
         raise VenteBotError("Supplier API disabled. Use local order status.")
     async def quote(self, *args, **kwargs):
@@ -242,6 +242,8 @@ async def init_db():
         managed_cols = {r[1] for r in await (await db.execute("PRAGMA table_info(managed_products)")).fetchall()}
         if "pin_order" not in managed_cols:
             await db.execute("ALTER TABLE managed_products ADD COLUMN pin_order INTEGER NOT NULL DEFAULT 0")
+        if "description" not in managed_cols:
+            await db.execute("ALTER TABLE managed_products ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         await db.commit()
 
 async def get_setting(key: str, default=None):
@@ -1076,11 +1078,35 @@ async def admin_manage_select(c: CallbackQuery):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💵 Edit Price", callback_data=f"admin:price_item:{pid}")],
             [InlineKeyboardButton(text="✏️ Rename Product", callback_data=f"admin:rename:{pid}")],
+            [InlineKeyboardButton(text="📝 Edit Description", callback_data=f"admin:description:{pid}")],
             [InlineKeyboardButton(text="↩️ Remove from Top" if is_pinned else "📌 Pin to Top", callback_data=f"admin:unpin:{pid}" if is_pinned else f"admin:pin:{pid}")],
             [InlineKeyboardButton(text="🙈 Hide Product", callback_data=f"admin:hide:{pid}")]])
         await c.message.answer(f"✏️ Edit: {name}", reply_markup=keyboard)
     await c.answer()
 
+
+@dp.callback_query(F.data.startswith("admin:description:"))
+async def admin_description_prompt(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("Not authorized", show_alert=True)
+    pid = c.data.split(":", 2)[2]
+    async with aiosqlite.connect(DB) as db:
+        row = await (await db.execute("SELECT description FROM managed_products WHERE product_id=?", (pid,))).fetchone()
+        if row is None:
+            return await c.answer("Product not found", show_alert=True)
+        await db.execute("INSERT INTO user_input_state(telegram_id,action,product_id) VALUES(?, 'admin_set_description', ?) ON CONFLICT(telegram_id) DO UPDATE SET action=excluded.action, product_id=excluded.product_id", (c.from_user.id, pid))
+        await db.commit()
+    await c.message.answer("📝 Send the full product description (up to 3500 characters).\nCurrent description: " + (row[0] or "Not set") + "\nSend /canceldescription to cancel.")
+    await c.answer()
+
+@dp.message(Command("canceldescription"))
+async def cancel_description(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action='admin_set_description'", (m.from_user.id,))
+        await db.commit()
+    await m.answer("Description edit cancelled.")
 
 @dp.callback_query(F.data.startswith("admin:pin:") | F.data.startswith("admin:unpin:"))
 async def admin_pin_product(c: CallbackQuery):
@@ -2242,6 +2268,14 @@ async def pending_text_input(m: Message):
         try: await m.delete()  # Reduce credential exposure in the Telegram admin chat.
         except Exception: pass
         return await m.answer("✅ One stock item saved. Use Stock Management to add another.")
+    if action == "admin_set_description":
+        if m.from_user.id not in ADMIN_IDS: return
+        if not 1 <= len(text) <= 3500: return await m.answer("Description must be 1–3500 characters.")
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("UPDATE managed_products SET description=? WHERE product_id=?", (text,pid))
+            await db.execute("DELETE FROM user_input_state WHERE telegram_id=?", (m.from_user.id,))
+            await db.commit()
+        return await m.answer("✅ Full product description saved. It will appear in Product Details.")
     if action == "admin_add_search":
         if m.from_user.id not in ADMIN_IDS: return
         if not 2 <= len(text) <= 100: return await m.answer("Product name must be 2–100 characters.")
@@ -2252,6 +2286,7 @@ async def pending_text_input(m: Message):
             await db.commit()
         return await m.answer(f"✅ Product added: {text}\nNow set its selling price:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💵 Set Product Price",callback_data=f"admin:price_item:{pid}")],
+            [InlineKeyboardButton(text="📝 Add Description",callback_data=f"admin:description:{pid}")],
             [InlineKeyboardButton(text="⏭️ Skip for Now",callback_data="admin:prices_noop")]]))
     if action == "admin_edit_search":
         return await admin_manage_search(m, text, "edit")
