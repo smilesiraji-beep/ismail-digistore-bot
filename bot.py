@@ -542,15 +542,12 @@ async def product_details(c: CallbackQuery):
         return
     name = clean_supplier_text(p.get("name") or p.get("title") or "Product")
     description = clean_supplier_text(p.get("description") or "")
-    stock = p.get("stock")
     price = await display_price(p)
     price_text = f"${price:.2f}" if isinstance(price, Decimal) else "Unavailable"
     text = f"<b>{name}</b>\n💵 Price: {price_text}"
     available = p.get("is_available", True)
-    text += "\n🟢 Available — Fulfilled after payment verification" if available else "\n🔴 Unavailable"
-    if stock is not None:
-        text += f"\n📦 Ready stock: {stock}"
-    text += f"\n🛍️ Supplier order capacity: {int(p.get('order_capacity', 0))}"
+    # Show the admin-set orderable quantity, not the local ready-inventory count.
+    text += f"\n📦 Available to order: {int(p.get('order_capacity', 0))}"
     if description:
         text += f"\n\n{description}"
     rows = []
