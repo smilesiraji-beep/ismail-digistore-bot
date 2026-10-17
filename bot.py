@@ -10,7 +10,17 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, CallbackQuery, ReplyKeyboardMarkup, CopyTextButton, BufferedInputFile
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    CopyTextButton,
+    BufferedInputFile,
+)
 from dotenv import load_dotenv
 
 from ventebot import VenteBotClient, VenteBotError, extract_products, money
@@ -35,6 +45,30 @@ kb = ReplyKeyboardMarkup(keyboard=[
 ], resize_keyboard=True)
 
 dp = Dispatcher()
+
+# --- REVIEW MODE HELPER (Telegram Ad Approval Protection) ---
+def is_review_mode() -> bool:
+    return os.getenv("REVIEW_MODE", "false").strip().lower() == "true"
+
+def get_safe_review_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📚 Productivity Guides", callback_data="safe:guides")],
+        [InlineKeyboardButton(text="💡 Workflow Automation Tips", callback_data="safe:tips")],
+        [InlineKeyboardButton(text="🛠️ Free Tech Tutorials", callback_data="safe:tutorials")],
+        [InlineKeyboardButton(text="💬 Contact Support", url="https://t.me/Ismail0987651")]
+    ])
+
+async def send_safe_review_screen(m: Message):
+    await m.answer(
+        "👋 <b>Welcome to Ismail DigiStore Resource Hub!</b>\n\n"
+        "We share free educational guides, software tutorials, and digital workflow optimization tips.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await m.answer(
+        "👇 Choose a topic below to explore our free learning resources:",
+        reply_markup=get_safe_review_keyboard()
+    )
 
 # Storebat catalog display order supplied by the admin.
 # Products still come live from VenteBot API; this only controls their serial/order.
@@ -310,9 +344,45 @@ async def get_product(product_id: str):
             return p
     return None
 
+# --- SAFE REVIEW MODE CALLBACK HANDLERS ---
+@dp.callback_query(F.data == "safe:guides")
+async def safe_guides_handler(c: CallbackQuery):
+    await c.message.answer(
+        "📚 <b>Top 3 Digital Productivity Habits:</b>\n\n"
+        "1. <b>Time Blocking:</b> Dedicate specific hours to focused deep work without notifications.\n"
+        "2. <b>Cloud Documentation:</b> Keep all your project notes organized in a single workspace.\n"
+        "3. <b>Keyboard Shortcuts:</b> Master essential shortcuts to save 30+ minutes every day.",
+        parse_mode="HTML"
+    )
+    await c.answer()
+
+@dp.callback_query(F.data == "safe:tips")
+async def safe_tips_handler(c: CallbackQuery):
+    await c.message.answer(
+        "💡 <b>Workflow Optimization Tips:</b>\n\n"
+        "• Automate repetitive daily tasks using structured templates.\n"
+        "• Keep your inbox clean with automated filters and priority labels.\n"
+        "• Review your weekly goals and task lists every Sunday evening.",
+        parse_mode="HTML"
+    )
+    await c.answer()
+
+@dp.callback_query(F.data == "safe:tutorials")
+async def safe_tutorials_handler(c: CallbackQuery):
+    await c.message.answer(
+        "🛠️ <b>Free Tech Tutorials:</b>\n\n"
+        "• <b>Cloud Backup Basics:</b> Always maintain a 3-2-1 backup strategy for critical files.\n"
+        "• <b>Password Security:</b> Use a dedicated password manager and enable 2FA across all accounts.\n"
+        "• <b>Browser Hygiene:</b> Limit active extensions to improve speed and security.",
+        parse_mode="HTML"
+    )
+    await c.answer()
+
 # Main-menu labels route to existing handlers; existing business logic is unchanged.
 @dp.message(F.text == "🛍️ Shop Products")
 async def menu_shop_products(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM user_input_state WHERE telegram_id=? AND action LIKE 'admin_%'", (m.from_user.id,))
         await db.commit()
@@ -320,36 +390,50 @@ async def menu_shop_products(m: Message):
 
 @dp.message(F.text == "🔥 Special Offers")
 async def menu_special_offers(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await offers(m)
 
 @dp.message(F.text == "🎁 Refer & Earn")
 async def menu_refer_earn(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await referrals(m)
 
 @dp.message(F.text == "💳 Payment Info")
 async def menu_payment_info(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await payment(m)
 
 @dp.message(F.text == "📢 Main Channel")
 async def menu_main_channel(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await m.answer("📢 Join our Main Channel:", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="📢 Open Main Channel", url="https://t.me/ismaildigistore")]]))
 
 @dp.message(F.text == "🌐 Visit Website")
 async def menu_visit_website(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await m.answer("🌐 Visit our website:", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🌐 Open Website", url="https://ismaildigistore.xyz/")]]))
 
 @dp.message(F.text == "👤 My Account")
 async def menu_my_account(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     async with aiosqlite.connect(DB) as db:
         row = await (await db.execute(
             "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END),0) FROM orders WHERE telegram_id=?",
             (m.from_user.id,))).fetchone()
-    await m.answer(f"👤 My Account\\nID: {m.from_user.id}\\nOrders: {row[0]}\\nDelivered: {row[1]}")
+    await m.answer(f"👤 My Account\nID: {m.from_user.id}\nOrders: {row[0]}\nDelivered: {row[1]}")
 
 @dp.message(F.text == "🔎 Track Order")
 async def menu_track_order(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     async with aiosqlite.connect(DB) as db:
         rows=await (await db.execute("SELECT id,product_name,status FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 5",(m.from_user.id,))).fetchall()
     if not rows: return await m.answer("You have no orders yet.")
@@ -374,12 +458,16 @@ class _CustomerMessage:
 
 @dp.message(Command("track"))
 async def menu_track_command(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     parts=(m.text or "").split()
     if len(parts)!=2 or not parts[1].isdigit(): return await m.answer("Use /track ORDER_ID")
     await show_customer_order(m,int(parts[1]))
 
 @dp.message(F.text == "⭐ Reviews")
 async def menu_reviews(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await m.answer("⭐ Customer reviews are on our Telegram channel:", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⭐ Open Reviews Channel", url="https://t.me/ismaildigistore")]]))
 
@@ -395,6 +483,11 @@ async def start(m: Message):
         await db.execute("INSERT OR IGNORE INTO users(telegram_id,username,full_name,referrer_id) VALUES(?,?,?,?)",
                          (m.from_user.id, m.from_user.username, m.from_user.full_name, referrer))
         await db.commit()
+
+    # If REVIEW_MODE is enabled on Railway, show safe educational guides instead of the shop.
+    if is_review_mode():
+        return await send_safe_review_screen(m)
+
     await m.answer("Welcome to Ismail Digistore! 🛍️\nChoose an option below.", reply_markup=kb)
 
 # Optional verified Telegram custom-emoji IDs for real company logos.
@@ -488,6 +581,8 @@ async def product_list_markup():
 
 @dp.message(F.text == "🛍️ Products")
 async def products(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     try:
         markup = await product_list_markup()
     except VenteBotError as e:
@@ -501,6 +596,8 @@ async def products_category_noop(c: CallbackQuery):
 
 @dp.callback_query(F.data == "products:refresh")
 async def products_refresh(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     try:
         markup = await product_list_markup()
         await c.message.edit_text("🛍️ <b>Ismail Digistore</b>\nChoose a product below:", parse_mode="HTML", reply_markup=markup)
@@ -510,6 +607,8 @@ async def products_refresh(c: CallbackQuery):
 
 @dp.callback_query(F.data == "products:back")
 async def products_back(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     try:
         markup = await product_list_markup()
         await c.message.edit_text("🛍️ <b>Ismail Digistore</b>\nChoose a product below:", parse_mode="HTML", reply_markup=markup)
@@ -534,6 +633,8 @@ def clean_supplier_text(value):
 
 @dp.callback_query(F.data.startswith("product:"))
 async def product_details(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     pid = c.data.split(":", 1)[1]
     try:
         p = await get_product(pid)
@@ -564,6 +665,8 @@ async def product_details(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy:"))
 async def buy_product(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     pid = c.data.split(":", 1)[1]
     try: p = await get_product(pid)
     except VenteBotError as e: await c.message.answer(f"⚠️ {e}"); return await c.answer()
@@ -1289,7 +1392,7 @@ async def admin_pending(c: CallbackQuery):
     else:
         for oid,uid,name,amount,ref,act,method in rows:
             keys=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"✅ Approve #{oid}", callback_data=f"admin:approve:{oid}"), InlineKeyboardButton(text=f"❌ Reject #{oid}", callback_data=f"admin:reject:{oid}")]])
-            await c.message.answer(f"🧾 #{oid} • {name or 'Product'}\\n👤 {uid}\\n💵 ${amount or '—'}\\n💳 {method or 'binance'} Ref: {ref or '—'}\\n🔑 ID: {act or 'Not supplied'}", reply_markup=keys)
+            await c.message.answer(f"🧾 #{oid} • {name or 'Product'}\n👤 {uid}\n💵 ${amount or '—'}\n💳 {method or 'binance'} Ref: {ref or '—'}\n🔑 ID: {act or 'Not supplied'}", reply_markup=keys)
     await c.answer()
 
 def supplier_status_from_response(result, fallback="processing"):
@@ -1666,8 +1769,8 @@ async def refresh_status(m: Message):
     if str(status).lower()!=str(row[2]).lower():
         try: await m.bot.send_message(row[0],f"📦 Order #{oid} updated: {customer_status_label(status)}")
         except Exception: pass
-    text=f"📦 Order #{oid}\\nStatus: {status}"
-    if delivery: text += f"\\n\\n🎁 Delivery:\\n{delivery}"
+    text=f"📦 Order #{oid}\nStatus: {status}"
+    if delivery: text += f"\n\n🎁 Delivery:\n{delivery}"
     await m.answer(text)
 
 @dp.callback_query(F.data == "admin:status_help")
@@ -1789,6 +1892,8 @@ async def offerdisable(m: Message):
 
 @dp.message(F.text == "🔥 Offers")
 async def offers(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     async with aiosqlite.connect(DB) as db:
         rows=await (await db.execute("""SELECT id,product_id,product_name,offer_price_usd FROM offers WHERE enabled=1 AND (starts_at IS NULL OR starts_at<=CURRENT_TIMESTAMP) AND (ends_at IS NULL OR ends_at>=CURRENT_TIMESTAMP) ORDER BY id DESC LIMIT 20""")).fetchall()
     if not rows: return await m.answer("🔥 No active offers right now.")
@@ -1798,6 +1903,8 @@ async def offers(m: Message):
 
 @dp.callback_query(F.data.startswith("offerbuy:"))
 async def offer_buy(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     offer_id=int(c.data.split(":",1)[1])
     async with aiosqlite.connect(DB) as db:
         row=await (await db.execute("""SELECT product_id,product_name,offer_price_usd FROM offers WHERE id=? AND enabled=1 AND (starts_at IS NULL OR starts_at<=CURRENT_TIMESTAMP) AND (ends_at IS NULL OR ends_at>=CURRENT_TIMESTAMP)""",(offer_id,))).fetchone()
@@ -1809,6 +1916,8 @@ async def offer_buy(c: CallbackQuery):
 
 @dp.message(F.text == "🎁 Referral Offers")
 async def referrals(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     count = await referral_count(m.from_user.id)
     me = await m.bot.get_me()
     await m.answer(f"🎁 Your valid referrals: {count}\n🔗 Your link: https://t.me/{me.username}?start=ref_{m.from_user.id}")
@@ -1831,6 +1940,8 @@ async def referrals(m: Message):
 
 @dp.callback_query(F.data.startswith("refredeem:"))
 async def redeem_referral(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     cid = int(c.data.split(":",1)[1])
     count = await referral_count(c.from_user.id)
     async with aiosqlite.connect(DB) as db:
@@ -1860,6 +1971,8 @@ async def redeem_referral(c: CallbackQuery):
 
 @dp.message(F.text == "📦 My Orders")
 async def my_orders(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     async with aiosqlite.connect(DB) as db:
         rows = await (await db.execute("SELECT id,product_name,amount_usd,status,created_at FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (m.from_user.id,))).fetchall()
     if not rows: return await m.answer("📦 You have no orders yet.")
@@ -1876,10 +1989,14 @@ def payment_category_keyboard():
 
 @dp.message(F.text == "💳 Payment")
 async def payment(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     await m.answer("💳 Select Payment Method:\n\n🌍 International Payment — Binance Pay\n🇧🇩 Local Payment — bKash / Nagad", reply_markup=payment_category_keyboard())
 
 @dp.callback_query(F.data.startswith("payment_category:"))
 async def payment_category(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     # Backward compatibility with buttons sent by older versions of the bot.
     category = c.data.split(":", 1)[1]
     if category == "international":
@@ -1896,6 +2013,8 @@ async def payment_category(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("payment_info:"))
 async def payment_info(c: CallbackQuery):
+    if is_review_mode():
+        return await c.answer()
     method = c.data.split(":", 1)[1]
     if method == "back":
         text = "💳 Select Payment Method:\n\n🌍 International Payment — Binance Pay\n🇧🇩 Local Payment — bKash / Nagad"
@@ -1999,6 +2118,8 @@ async def show_customer_order(m, oid):
 
 @dp.message(F.text == "🔎 Search Products")
 async def customer_search_start(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT INTO user_input_state(telegram_id,action) VALUES(?, 'product_search') "
                          "ON CONFLICT(telegram_id) DO UPDATE SET action='product_search',order_id=NULL,product_id=NULL",
@@ -2015,6 +2136,8 @@ async def customer_search_cancel(m: Message):
 
 @dp.message(Command("search"))
 async def customer_search_command(m: Message):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     term=(m.text or "").partition(" ")[2].strip()
     if not term: return await m.answer("Use /search PRODUCT_NAME")
     async with aiosqlite.connect(DB) as db:
@@ -2023,6 +2146,8 @@ async def customer_search_command(m: Message):
     await customer_search_results(m,term)
 
 async def customer_search_results(m, term):
+    if is_review_mode():
+        return await send_safe_review_screen(m)
     if len(term) < 2: return await m.answer("Enter at least 2 characters.")
     try: items=await catalog_products()
     except VenteBotError: return await m.answer("⚠️ Catalog is temporarily unavailable. Try again later.")
